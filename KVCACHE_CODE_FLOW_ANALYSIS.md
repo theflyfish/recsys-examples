@@ -1,776 +1,349 @@
-# KVCache 功能在代码流程中的应用详细分析
+# KVCache 功能在代码流程中的应用（代码级详细分析）
 
-## 概述
-
-KVCache（Key-Value Cache）是推荐系统中用于加速LLM推理的关键技术。该系统为基于用户ID的缓存管理提供支持，实现了GPU内存和主机内存间的智能分层存储，大幅提升推理性能。
-
----
-
-## 1. 核心架构设计
-
-### 1.1 分层缓存体系结构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    KVCacheManager (主控接口)                  │
-│  - 统筹GPU和主机缓存的上层协调器                               │
-└────┬──────────────────────────────────────┬──────────────────┘
-     │                                      │
-     ▼                                      ▼
-┌──────────────────────┐        ┌──────────────────────────────┐
-│ GPUKVCacheManager    │        │ HostKVStorageManagerBase      │
-│  (GPU内存缓存)        │        │  (主机/SSD/远程存储)           │
-│                      │        │                              │
-│ - Paged KVCache      │        ├─ NativeHostKVCacheManager   │
-│ - LRU页面驱逐策略    │        │   (CPU内存缓存)              │
-│ - 快速查询和分配     │        │                              │
-└──────────────────────┘        └─ FlexKVStorageManager       │
-                                 (FlexKV系统集成)             │
-```
-
-### 1.2 关键组件
-
-| 组件 | 职责 | 特点 |
-|------|------|------|
-| **KVCacheManager** | 上层统筹接口 | 协调GPU和主机缓存操作 |
-| **GPUKVCacheManager** | GPU缓存管理 | 组织为分页表，支持LRU驱逐 |
-| **NativeHostKVCacheManager** | 主机内存缓存 | 支持分层onboarding/offloading |
-| **FlexKVStorageManager** | FlexKV集成 | 支持多层次存储（CPU/SSD/远程） |
+> 本文档基于对仓库源码的逐行阅读编写，所有结论均给出 `文件:行号` 引用，便于核对。
+> 适用范围：`corelib/recsys_kvcache_manager`（KV 缓存库）与 `examples/hstu`（HSTU 推理调用方）。
 
 ---
 
-## 2. 数据结构和关键概念
+## 1. 设计目标与整体结构
 
-### 2.1 KVLookupResult（查询结果）
+`recsys_kvcache_manager` 为生成式推荐模型推理提供 **LLM 兼容的 KV 缓存**。其核心特点是
+**按推荐系统用户 ID（user_id）缓存**，而不是像 LLM 那样按 token 前缀匹配
+——因为推荐场景下不同用户的行为序列几乎没有公共前缀，按 user_id 查找是 O(1) 且更贴合业务
+（见 `corelib/recsys_kvcache_manager/README.md:18-22`）。
 
-```python
-@dataclass
-class KVLookupResult:
-    user_ids: torch.Tensor                    # 用户ID列表
-    cached_lengths: torch.Tensor              # 总缓存长度
-    
-    # GPU缓存信息
-    gpu_cached_start_indices: torch.Tensor    # GPU缓存起始位置
-    gpu_cached_lengths: torch.Tensor          # GPU缓存长度
-    
-    # 主机缓存信息
-    host_cached_start_indices: torch.Tensor   # 主机缓存起始位置
-    host_cached_lengths: torch.Tensor         # 主机缓存长度
+### 1.1 类层次结构
+
+```
+KVCacheManager                       # 上层协调接口 (kvcache_manager.py)
+ ├── GPUKVCacheManager               # GPU 分页 KV 表 (gpu_kvcache_manager.py)
+ └── HostKVStorageManagerBase        # 主机/SSD/远端存储接口 (host_kvstorage_manager.py)
+       ├── NativeHostKVCacheManager  # 纯 pinned host memory (native_host_kvcache_manager.py)
+       └── FlexKVStorageManager      # 接入 FlexKV 多级存储 (flex_kvcache_manager.py)
 ```
 
-**作用**：统一表示GPU和主机缓存的查询结果，支持合并操作
+- `KVCacheManager` 同时持有一个 `gpu_kvcache_mgr` 和一个 `host_kvstorage_manager`，
+  在构造时把 GPU 缓存表注册给 host 端（`kvcache_manager.py:49-55`）。
+- 底层 GPU 实现由 C++ 扩展 `kvcache_cpp.GPUKVCacheManagerImpl` 提供
+  （`gpu_kvcache_manager.py:19,65-76`）；host 端由 `kvcache_cpp.HostKVStorageImpl` 提供
+  （`native_host_kvcache_manager.py:20,61-71`）。Python 层主要负责编排与元数据组织。
 
-### 2.2 KVCacheMetadata（缓存元数据）
+### 1.2 GPU 缓存张量布局
 
-```python
-class KVCacheMetadata:
-    kv_cache_table: List[torch.Tensor]        # GPU缓存表指针
-    page_ids_gpu_buffer: torch.Tensor         # 页ID缓冲
-    metadata_gpu_buffer: torch.Tensor         # 元数据缓冲
-    
-    # 页管理
-    kv_indices: torch.Tensor                  # KV页索引
-    kv_indptr: torch.Tensor                   # KV索引指针
-    kv_last_page_len: torch.Tensor            # 最后页长度
-    
-    # 位置和批处理信息
-    batch_indices: torch.Tensor               # 批索引
-    position: torch.Tensor                    # 位置信息
-    new_history_nnz: torch.Tensor             # 新历史非零数
-```
-
-**作用**：保存缓存分配、索引和写入所需的所有元数据
-
-### 2.3 KVIndexMeta（索引元数据）
+GPU 缓存是一块连续张量，按层切分后再按 k/v 切分（`gpu_kvcache_manager.py:52-64`）：
 
 ```python
-@dataclass
-class KVIndexMeta:
-    user_ids: torch.Tensor                    # 用户ID列表
-    seq_lengths: torch.Tensor                 # 序列总长度
+gpu_kvcache_tensor: [num_layers, num_primary_cache_pages, 2(k/v), page_size, num_heads, head_dim]
+gpu_kvcache_tables = list(tensor.unbind(dim=0))   # 每层一个视图
+# 层内再 unbind(dim=1) 得到 (paged_k_cache, paged_v_cache)
 ```
+
+这是 **paged KV cache**：物理上以「页（page）」为单位管理，每页 `page_size` 个 token。
+HSTU 注意力 kernel 可直接从该分页表读取，无需额外拷贝
+（`README.md:42-43`）。
 
 ---
 
-## 3. 完整推理流程分析
+## 2. 关键数据结构
 
-### 3.1 高级流程概览
+### 2.1 `KVLookupResult`（查找结果，`kvcache_utils.py:28-124`）
+
+同时承载 GPU 与 host 两级缓存的命中信息，并提供 `merge()` 把两者合并：
+
+| 字段 | 含义 |
+|------|------|
+| `gpu_cached_start_indices` / `gpu_cached_lengths` | GPU 中该用户已缓存的起始位置与长度 |
+| `host_cached_start_indices` / `host_cached_lengths` | host 中该用户已缓存的起始位置与长度 |
+| `cached_start_indices` / `cached_lengths` | merge 后的「综合已缓存」起始与长度 |
+
+`merge()` 的合并规则（`kvcache_utils.py:46-124`）逐样本计算：
+- host 无缓存 → 取 GPU 命中；
+- GPU 无缓存 → 取 host 命中（并断言 host 从序列开头缓存，`host_cached_start_indices==0`）；
+- 两者都有 → 取 `max(host_len, gpu_start+gpu_len)`，并要求 `gpu_start <= host_len`（不允许空洞）。
+
+### 2.2 `KVCacheMetadata`（缓存元数据，`kvcache_metadata.py:22-59`）
+
+描述「一个 batch 的分页 KV 状态」，是分配/写入/读取的核心载体。关键点：
+**所有整型元数据共用一块扁平 buffer `metadata_gpu_buffer`，再切片成多个视图**
+（`kvcache_metadata.py:83-110`），这样便于一次性管理、且对 CUDA Graph 友好：
 
 ```
-输入：用户ID + 序列长度
-  ↓
-【1】lookup_kvcache
-  ├─ GPU查询：检查GPU缓存中的cached_length
-  ├─ 主机查询：检查主机/SSD中的cached_length
-  └─ 合并结果：GPU + Host缓存长度合并
-  ↓
-【2】allocate_kvcache
-  ├─ 计算新增token数：new_tokens = seq_lengths - cached_lengths
-  ├─ GPU分页分配：LRU驱逐不需要的页面
-  └─ 生成元数据：页ID、索引指针等
-  ↓
-【3】onboard_launch（异步）
-  ├─ 确定待加载数据：从主机读取需要的KV数据
-  └─ 启动H2D传输：Host → GPU，与其他操作重叠
-  ↓
-【4】strip_cached_tokens（预处理）
-  ├─ 去掉已缓存的token
-  ├─ 只保留新增token和contextual feature
-  └─ 构建新的输入批
-  ↓
-【5】嵌入查询与预处理
-  └─ 计算新增token的embedding
-  ↓
-【6】onboard_wait（同步）
-  └─ 确保H2D传输完成（或按层等待）
-  ↓
-【7】HSTU推理（关键阶段）
-  ├─ 对新增token执行self-attention
-  ├─ 读取GPU分页缓存的KV数据
-  └─ 计算attention，生成新的KV
-  ↓
-【8】KV写入
-  └─ 新KV数据写入GPU分页缓存表
-  ↓
-【9】offload_launch（异步）
-  ├─ 确定待写回用户
-  └─ 启动D2H传输：GPU → Host
-  ↓
-【10】后处理与输出
-  └─ 返回排序logits
+metadata_gpu_buffer (int32, 长度 = 5*B + 4 + 2*num_new_tokens) 切片为：
+  kv_indptr (B+1) | kv_last_page_len (B) | total_history_lengths (B)
+  | total_history_offsets (B+1) | new_history_nnz_cuda (1)
+  | new_history_offsets (B+1) | batch_indices (num_new_tokens) | position (num_new_tokens)
 ```
 
-### 3.2 详细代码流程
+- `kv_indices`（即 `page_ids_gpu_buffer`）：分页表中的物理页 ID 列表。
+- `kv_indptr`：每个序列在 `kv_indices` 中的页区间指针（CSR 风格）。
+- `kv_last_page_len`：每序列最后一页的有效长度。
+- `batch_indices` / `position`：新增 token 的 append 定位信息。
+- `kv_seqlens` / `kv_seqlen_offsets`：**注意力实际读取长度** = 历史 + candidates（见 §4.3）。
+- `kv_onload_handle`：异步 onboard（H2D）句柄，支持按层等待。
 
-#### 阶段1：查询缓存
+### 2.3 `KVIndexMeta`（`kvcache_utils.py:127-129`）
+
+仅含 `user_ids` 与 `seq_lengths`，作为 host 端查找/索引的轻量句柄。
+
+---
+
+## 3. 配置入口
+
+`KVCacheConfig`（`kvcache_config.py:22-62`）定义全部参数，经
+`KVCacheManager.from_config()`（`kvcache_manager.py:352-380`）构造：
+- 约束 `offload_chunksize % page_size == 0`（`kvcache_manager.py:354-356`）。
+- 依据 `host_kvstorage_backend` 选择 `native` 或 `flexkv` 后端
+  （`kvcache_manager.py:285-350`）。
+- `offload_mode`（lazy/eager，`kvcache_utils.py:23-25`）、
+  `host_kvstorage_fail_policy`（fail_open/fail_close）等策略在此注入。
+
+在 HSTU 模型中，缓存对象在 `InferenceDenseModule.setup_for_kvcache()` 创建：
+`self.kvcache = KVCacheManager.from_config(kvcache_config)`（`inference_dense_module.py:213-217`）。
+
+---
+
+## 4. 端到端推理流程（以 HSTU ranking 为例）
+
+入口：`InferenceRankingGR.forward_with_kvcache()`（`inference_ranking_gr.py:137-177`）。
+下面按实际调用顺序拆解，并标注每步的「重叠对象」。
+
+### 4.1 顶层编排（`inference_ranking_gr.py:137-177`）
 
 ```python
-# 文件：InferenceRankingGR.forward_with_kvcache()
+# ① 查找：GPU + host 两级
 index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
-    user_ids,                  # 当前请求的用户ID
-    total_history_lengths,     # 该用户的完整历史长度
-)
+    user_ids, total_history_lengths)
 
-# 内部流程（KVCacheManager.lookup_kvcache）
-def lookup_kvcache(self, user_ids, sequence_lengths):
-    # 1. GPU缓存查询
-    gpu_lookup_results = self.gpu_kvcache_mgr.lookup(user_ids)
-    # 返回：user_id对应的GPU缓存起始位置和长度
-    
-    # 2. 主机缓存查询
-    index_meta = self.host_kvstorage_manager.build_index_meta(
-        user_ids, sequence_lengths
-    )
-    host_lookup_results = self.host_kvstorage_manager.lookup_kvcache(index_meta)
-    # 返回：user_id对应的主机缓存长度
-    
-    # 3. 合并结果
-    lookup_results = KVLookupResult.merge(gpu_lookup_results, host_lookup_results)
-    # 合并规则：
-    # - 优先返回GPU缓存（最快访问）
-    # - 如果GPU缓存不足，返回主机缓存
-    # - 如果都有缓存，计算总缓存覆盖范围
-    
-    return index_meta, lookup_results
+# ② 在 GPU 分页表中分配页（含 LRU 驱逐）
+kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(index_meta, lookup_res)
+
+# ③ 异步 onboard（host→GPU），与后续 strip + embedding 重叠
+self.dense_module.kvcache.onboard_launch(index_meta, lookup_res, kvcache_metadata)
+
+# ④ 剥离已缓存 token，仅保留新增 token + contextual
+old_cached_lengths = lookup_res.cached_lengths
+striped_batch = self.strip_cached_tokens(batch, old_cached_lengths)
+
+# ⑤ 仅对新增 token 做 embedding 查找（计算量随之下降）
+embeddings = self.sparse_module(striped_batch.features)
+
+# ⑥ 进入 dense（HSTU + offload + MLP）
+kvcache_info = (index_meta, lookup_res, kvcache_metadata)
+logits = self.dense_module.forward_with_kvcache(
+    striped_batch, embeddings, user_ids, total_history_lengths, kvcache_info)
 ```
 
-#### 阶段2：缓存分配
+### 4.2 ① 查找 `lookup_kvcache`（`kvcache_manager.py:66-78`）
 
 ```python
-# 文件：KVCacheManager.allocate_kvcache()
-kvcache_metadata = self.gpu_kvcache_mgr.allocate(
-    index_meta.user_ids,
-    index_meta.seq_lengths,
-    lookup_results,
-)
+gpu_lookup_results = self.gpu_kvcache_mgr.lookup(user_ids)          # GPU 命中
+index_meta = self.host_kvstorage_manager.build_index_meta(user_ids, sequence_lengths)
+host_lookup_results = self.host_kvstorage_manager.lookup_kvcache(index_meta)  # host 命中
+lookup_results = KVLookupResult.merge(gpu_lookup_results, host_lookup_results) # 合并
+```
+- GPU 端 `lookup` 调 C++ `impl_.lookup`（`gpu_kvcache_manager.py:89-95`）。
+- native host 端 `lookup` 返回 host 缓存长度，起始恒为 0
+  （`native_host_kvcache_manager.py:88-95`）。
 
-# 内部流程（GPUKVCacheManager.allocate）
-def allocate(self, uids, seq_hist_lengths, lookup_results):
-    # 1. 计算新增token
-    new_hist_lengths = seq_hist_lengths - lookup_results.cached_lengths
-    
-    # 2. 分页计算
-    num_new_tokens = sum(new_hist_lengths)
-    num_total_pages = ceil(sum(seq_hist_lengths) / page_size)
-    
-    # 3. 分配GPU页面
-    #    如果GPU页面不足，根据LRU策略驱逐最久未用的用户数据
-    self.impl_.allocate(
-        uids,
-        seq_hist_lengths,
-        lookup_results.host_cached_lengths,
-        output_kvcache_metadata.page_ids_gpu_buffer,    # GPU分配的页ID
-        output_kvcache_metadata.metadata_gpu_buffer,    # 管理元数据
-    )
-    
-    return output_kvcache_metadata
+### 4.3 ② 分配 `allocate_kvcache → GPUKVCacheManager.allocate`（`gpu_kvcache_manager.py:97-126`）
+
+```python
+new_hist_lengths = seq_hist_lengths - lookup_results.cached_lengths   # 真正需要新算的 token
+num_new_tokens = sum(new_hist_lengths)
+num_total_pages = sum(ceil(seq_hist_lengths / page_size))
+output_kvcache_metadata = get_kvcache_metadata_buffer(batch_size, num_new_tokens, num_total_pages)
+output_kvcache_metadata.kv_cache_table = self.gpu_kvcache_tables
+self.impl_.allocate(uids, seq_hist_lengths, host_cached_lengths,
+                    page_ids_gpu_buffer, metadata_gpu_buffer)   # C++：分页 + LRU 驱逐
+```
+- 若 GPU 页不足，由 C++ 实现按 **LRU** 驱逐最久未用用户的页（`README.md:42-43,71`）。
+- 注意：当前实现 **驱逐时不做 offload**（`README.md:71`）。
+- `allocate_kvcache` 是 **host 阻塞** 的，无法与其它操作重叠（`README.md:87`，已知限制）。
+
+### 4.4 ③ 异步 onboard `onboard_launch`（`kvcache_manager.py:93-108`）
+
+转发到 host 后端的 `onboard_kvcache_launch`。以 native 为例
+（`native_host_kvcache_manager.py:97-150`）：
+- 计算需要从 host 拉到 GPU 的区间：比较 `gpu_end = gpu_start+gpu_len` 与 `host_len`，
+  只搬运 GPU 缺失而 host 有的部分（`native_host_kvcache_manager.py:103-117`）。
+- 据 `kv_indptr/kv_indices` 取出目标 GPU 页列表，调用 `impl_.onload_kvcache(...)`
+  发起异步 H2D，返回 `KVOnloadHandle`（`native_host_kvcache_manager.py:119-148`）。
+- 若无数据需搬运，返回 `SKIPPED`（`native_host_kvcache_manager.py:129-137`）。
+- 句柄写回 `kvcache_metadata.kv_onload_handle`（`kvcache_manager.py:104`），
+  供后续 **按层等待**。native 后端 `is_layerwise=True`（`native_host_kvcache_manager.py:148`）。
+
+### 4.5 ④ 剥离已缓存 token `strip_cached_tokens`（`inference_ranking_gr.py:86-135`）
+
+- contextual 特征不进缓存，需扣除：`num_cached = clamp_min(origin_num_cached - num_context, 0)`
+  （`inference_ranking_gr.py:89-91`）。
+- 行为序列按 item/action 拆分缓存量
+  （`inference_ranking_gr.py:92-94`）。
+- 重建 `KeyedJaggedTensor`：仅保留未缓存的历史 token 与 contextual
+  （`inference_ranking_gr.py:101-132`）。这样后续 embedding 与 HSTU 只处理「新增 token」。
+
+### 4.6 ⑥ dense 前向 `forward_with_kvcache`（`inference_dense_module.py:331-395`）
+
+```python
+# 预处理：用 cached_lengths 作为新 token 的位置起点（位置编码对齐历史）
+jagged_data = self._hstu_block._preprocessor(
+    embeddings=embeddings, batch=batch,
+    seq_start_position=kv_lookup_result.cached_lengths.cuda())   # :346-350
+
+# 注意力实际读取长度 = 历史 + candidates
+kvcache_metadata.kv_seqlen_offsets = total_history_offsets + num_candidates_offsets  # :354-357
+kvcache_metadata.kv_seqlens       = total_history_lengths + num_candidates           # :358-360
+kvcache_metadata.max_seqlen      += max_num_candidates                               # :361
+
+# HSTU 计算（可选 CUDA Graph 路径，见 §5）
+hstu_output = self._hstu_block.predict(batch_size, num_tokens, hidden, jd, kvcache_metadata)  # :371-387
+
+# 先回收已完成的 offload，再发起本批 offload（与下面 post+MLP 重叠）
+self.kvcache.offload_try_wait()                              # :389
+self.kvcache.offload_launch(kv_index_meta, kvcache_metadata) # :390
+
+# 后处理 + 预测头
+jagged_data = self._hstu_block._postprocessor(jagged_data)   # :392
+jagged_item_logit = self._mlp(jagged_data.values)            # :393
 ```
 
-**关键点**：
-- `new_hist_lengths` 表示需要新计算的token数量
-- GPU分页是高效KV访问的基础
-- LRU驱逐确保热用户数据优先留在GPU
+**关键纠正**：offload 在 dense 模块内、HSTU 计算之后、postprocessor+MLP 之前发起，
+从而与 post/MLP 重叠；并非在顶层 ranking 模块。
 
-#### 阶段3：异步上板（主机→GPU）
+### 4.7 注意力层内：KV 写入与读取（核心，`paged_hstu_infer_layer.py`）
 
-```python
-# 文件：InferenceRankingGR.forward_with_kvcache()
-# 启动异步传输，与embedding查询重叠
-self.dense_module.kvcache.onboard_launch(
-    index_meta, lookup_res, kvcache_metadata
-)
-
-# 内部流程（NativeHostKVCacheManager.onboard_kvcache_launch）
-def onboard_kvcache_launch(self, index_meta, lookup_result, kvcache_metadata):
-    # 1. 确定待上板范围
-    # GPU缓存结束位置
-    g_end_idxs = lookup_result.gpu_cached_start_indices + lookup_result.gpu_cached_lengths
-    # 主机缓存更长的标志
-    h_longer = g_end_idxs < lookup_result.host_cached_lengths
-    
-    # 2. 上板起始位置和长度
-    onload_start_indices = where(h_longer, g_end_idxs, 0)
-    onload_lengths = where(h_longer, host_cached_lengths, gpu_cached_start_indices)
-    
-    # 3. 获取待传输的GPU页ID列表
-    onload_paged_ids_list = [
-        kvcache_metadata.kv_indices[page_range]
-        for each user
-    ]
-    
-    # 4. 启动异步H2D传输
-    native_handle = KVOnloadHandle(self.num_layers)
-    self.impl_.onload_kvcache(
-        index_meta.user_ids,
-        onload_paged_ids_list,
-        native_handle  # 用于后续跟踪传输状态
-    )
-    
-    return task_handle
-```
-
-**关键点**：
-- 不是所有数据都需要上板，只有GPU缺失的部分
-- 使用侧通道CUDA流进行异步传输
-- 允许H2D与embedding计算重叠
-
-#### 阶段4：Token去重和输入构建
+KV 的 **写入** 和 **读取** 都发生在 **每个 HSTU 注意力层内部**，而不是由 manager 单独编排。
+以 eager 路径 `forward_naive`（`paged_hstu_infer_layer.py:256-359`）为例：
 
 ```python
-# 文件：InferenceRankingGR.strip_cached_tokens()
-def strip_cached_tokens(self, batch, origin_num_cached):
-    # 1. 分解缓存token
-    # contextual feature 不能缓存，必须重新处理
-    num_context = len(batch.contextual_feature_names)
-    num_cached = clamp_min(origin_num_cached - num_context, 0)
-    
-    # 2. 拆分行为和物品历史缓存
-    num_cached_action = num_cached // 2
-    num_cached_item = num_cached - num_cached_action
-    
-    # 3. 构建新输入序列
-    # 去掉已缓存的token，只保留新token
-    new_lengths = zeros_like(old_lengths)
-    new_lengths[:item_offset] = old_lengths[:item_offset]  # contextual
-    new_lengths[item_offset:] = old_lengths[item_offset:] - num_cached_item/action  # new only
-    
-    # 4. 提取新token值
-    new_hist_value = [
-        old_values[startpos[idx] : endpos[idx]]  # 去掉cached部分
-        for idx in range(2 * batch.batch_size)
-    ]
-    
-    return modified_batch_with_new_tokens_only
-```
+# 1) 线性投影得到 u,v,q,k；其中 k,v 是「新增 token」当前层的 KV
+mixed_uvqk = self.uvqk_addmm_impl(normed_input, num_tokens)
+(user, value, query, key) = torch.split(mixed_uvqk, self._split_arg_list, dim=-1)  # :274-283
 
-**优势**：
-- 减少embedding计算量
-- 只有新token需要经过HSTU层
-- Contextual feature被保留用于attention计算
+if kv_cache_metadata is not None:
+    kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
+    (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
 
-#### 阶段5：HSTU层处理与KV写入
-
-```python
-# 文件：InferenceDenseModule.forward_with_kvcache()
-for layer_idx in range(num_layers):
-    # 1. 层级onboard等待（仅native后端）
-    kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
-    
-    # 2. HSTU注意力计算
-    # 读取GPU分页缓存中的KV数据
-    attention_output = hstu_block[layer_idx](
-        hidden_states,
-        kvcache_metadata,  # 包含kv_indices, kv_indptr等
-    )
-    
-    # 3. 新KV数据写入GPU分页缓存
+    # 2) 把新增 token 的 k,v 追加进分页表（写）
     paged_kvcache_ops.append_kvcache(
-        k_new,  # 当前层新生成的K
-        v_new,  # 当前层新生成的V
-        kvcache_metadata.batch_indices,
-        kvcache_metadata.position,
-        kvcache_metadata.kv_indices,      # GPU页ID
-        kvcache_metadata.kv_indptr,       # 页偏移指针
-        kvcache_metadata.kv_last_page_len,  # 最后页长度
-    )
-    
-    hidden_states = attention_output
+        key, value,
+        kv_cache_metadata.batch_indices, kv_cache_metadata.position,
+        jd.num_candidates_offsets[:batch_size+1],
+        kv_cache_metadata.new_history_nnz_cuda, kv_cache_metadata.new_history_nnz,
+        paged_k_cache, paged_v_cache,
+        kv_cache_metadata.kv_indices, kv_cache_metadata.kv_indptr,
+        kv_cache_metadata.kv_last_page_len, 0, self.num_sms)            # :288-303
+
+    # 3) 按层等待该层的 onboard(H2D) 完成，确保历史 KV 已就位
+    if kv_cache_metadata.kv_onload_handle is not None:
+        kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)  # :305-306
+
+    # 4) 注意力直接从分页表读取（历史KV + 刚写入的新KV）
+    jagged_attn_output = hstu_attn_varlen_func(
+        query, key, value,
+        jd.seqlen_offsets[:batch_size+1],
+        kv_cache_metadata.kv_seqlen_offsets[:batch_size+1],
+        ... ,
+        kv_cache=kv_cache_table,
+        page_offsets=kv_cache_metadata.kv_indptr,
+        page_ids=kv_cache_metadata.kv_indices,
+        last_page_lens=kv_cache_metadata.kv_last_page_len)             # :307-327
 ```
 
-**核心机制**：
-- `kv_indices`：映射逻辑位置到GPU物理页
-- `kv_indptr`：指针数组，快速定位用户数据起始页
-- `append_kvcache`：高效的原子操作，在分页表中追加KV数据
-
-#### 阶段6：异步下板（GPU→主机）
-
-```python
-# 文件：InferenceRankingGR.forward_with_kvcache()
-# 在post-processing前启动异步下板
-kvcache_mgr.offload_launch(index_meta)
-
-# 内部流程（KVCacheManager.offload_launch）
-def offload_launch(self, index_meta):
-    # 1. 确定待下板用户
-    uids_to_offload = self.gpu_kvcache_mgr.check_for_offload(
-        index_meta.user_ids
-    )
-    # 返回：可以下板到主机的user_ids
-    # 策略：LRU，释放最久未用的用户数据
-    
-    # 2. 获取待下板的GPU页面信息
-    (
-        offload_user_ids,
-        offload_start_indices,
-        offload_page_indices_list,
-    ) = self.gpu_kvcache_mgr.acquire_offload_pages(
-        uids_to_offload,
-        offloaded_lengths,  # 该用户已在主机中的缓存长度
-    )
-    # 页面被锁定，防止并发访问
-    
-    # 3. 启动异步D2H传输
-    task_handle = self.host_kvstorage_manager.offload_kvcache_launch(
-        offload_user_ids,
-        offload_start_indices,
-        offload_page_indices_list,
-    )
-    
-    self.ongoing_offload_tasks.append(task_handle)
-```
-
-**设计考虑**：
-- 下板操作完全异步，不阻塞当前推理
-- 使用offload_try_wait()非阻塞轮询任务完成
-- 失败时根据fail_policy决定是否继续推理
-
-#### 阶段7：异步任务轮询
-
-```python
-# 文件：KVCacheManager.offload_try_wait()
-def offload_try_wait(self):
-    remain_tasks = []
-    for task_handle in self.ongoing_offload_tasks:
-        wait_result = self.host_kvstorage_manager.offload_kvcache_wait(task_handle)
-        
-        if wait_result.status == HostKVTaskStatus.LAUNCHED:
-            # 任务还在进行，继续等待
-            remain_tasks.append(task_handle)
-            
-        elif wait_result.status == HostKVTaskStatus.READY:
-            # 任务完成，释放GPU页面锁
-            self.host_kvstorage_manager.finish_task(task_handle)
-            self.gpu_kvcache_mgr.release_offload_pages(
-                offload_user_ids,
-                offload_start_indices,
-                offload_lengths,
-                offloaded=[1, 1, ...],  # 标记成功下板
-            )
-            
-        elif wait_result.status in (FAILED, TIMEOUT, CANCELLED):
-            # 下板失败处理
-            if self.host_kvstorage_fail_policy == "fail_close":
-                raise RuntimeError(...)
-            else:  # fail_open
-                self.gpu_kvcache_mgr.release_offload_pages(
-                    offload_user_ids,
-                    offload_start_indices,
-                    offload_lengths,
-                    offloaded=[0, 0, ...],  # 标记下板失败，GPU数据保留
-                )
-    
-    self.ongoing_offload_tasks = remain_tasks  # 只保留进行中的任务
-```
+要点：
+- **写在读之前**：每层先 `append_kvcache` 写入新 token 的 KV，再 `stream_wait_layer`，
+  再做 attention 读取（历史 + 新增）。
+- `stream_wait_layer` 实现按层 H2D/计算重叠：`HostKVTaskHandle.stream_wait_layer`
+  仅在 `is_layerwise` 时调用底层 `handle.wait_layer(layer_idx)`（`host_kvstorage_manager.py:74-76`）。
+  native 后端支持，因此可把第 L 层 H2D 与前面层的计算重叠（`README.md:45-47`）。
 
 ---
 
-## 4. 性能优化策略
+## 5. 两条执行路径：eager 与 CUDA Graph
 
-### 4.1 异步重叠机制
+`HSTUBlockInference.predict()` 根据是否启用 graph 分流（`hstu_block_inference.py:63-85`）：
 
-```
-时间轴：
-┌─────────────────────────────────────────────────────────────┐
-│ Request 1: lookup → allocate → onboard_launch               │
-│            (可与其他操作重叠)                                 │
-│            │ ─────────┬────────────────────────────────────┤
-│            │          │ strip_tokens + embedding            │
-│            │          │ (H2D与此重叠)                       │
-│            │          ├────────┬──────────────────────────┤
-│            │          │        │ onboard_wait             │
-│            │          │        ├────────┬────────────────┤
-│            │          │        │        │ HSTU inference │
-│            │          │        │        └────────────────┘
-│            │          │        └─────────────────────────┘
-│            └────────────────────────────────────────────────┤
-│                                          offload_launch     │
-│                                          (后台继续运行)     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**关键优化**：
-1. **H2D与Embedding重叠**：在计算embedding时同步传输KV数据
-2. **D2H后台运行**：下板操作完全异步，不影响当前推理
-3. **分层Onboarding**（native后端）：按层等待，上一层H2D完成后立即计算
-
-### 4.2 LRU驱逐策略
-
-```python
-# GPU缓存满时的驱逐逻辑
-当 gpu_cache_used_pages >= num_primary_cache_pages:
-    触发LRU驱逐：
-    1. 找到最久未使用的用户
-    2. 将其所有页面从GPU转到offload_pages（待传输列表）
-    3. 将页面标记为可用
-    4. 立即分配给新用户或新请求
-    
-    优点：
-    - 热用户数据优先留在GPU
-    - 最小化冷用户重新加载延迟
-```
-
-### 4.3 用户级缓存管理
-
-```
-KVCache按用户ID管理，而不是按token值比较：
-
-✓ 优势（相比token-value匹配）：
-  - 推荐系统中用户行为序列差异大，不同用户几乎无公共前缀
-  - 用户ID查询O(1)，token值比较O(n)
-  - 完全避免token匹配的复杂性
-  
-用户级缓存流程：
-┌─────────────────────────────────────────────────────┐
-│ User A: [action_1, ..., action_k] KV缓存           │
-│ User B: [item_1, ..., item_m] KV缓存               │
-│ User C: [action_n, ..., action_n+5] KV缓存         │
-│ ...                                                 │
-└─────────────────────────────────────────────────────┘
-  查询直接按user_id：O(1)
-  无需token sequence比较
-```
+- **eager**：逐层调用 `forward_naive`（写 KV→按层等待→attention），见 §4.7。
+- **CUDA Graph**：`forward_input`/`forward_output` 拆分以便分段 capture
+  （`paged_hstu_infer_layer.py:361-474`）：
+  - `forward_input`：做投影并 `append_kvcache` 写入（`:393-408`）；
+  - `forward_output`：做 attention 读取（`:435-457`）；
+  - 回放时在层间插入 `kv_onload_handle.stream_wait_layer(idx-1)`
+    （`hstu_block_inference.py:158-161`）。
+- CUDA Graph 下用 `copy_kvcache_metadata` 把动态 metadata 拷入静态 buffer
+  （`inference_dense_module.py:369`、`kvcache_metadata.py:134-157`）。
 
 ---
 
-## 5. 容量管理
+## 6. Offload（GPU→host）异步链路
 
-### 5.1 GPU缓存容量
+### 6.1 发起 `offload_launch`（`kvcache_manager.py:166-233`）
 
-```
-总容量 = num_primary_cache_pages × page_size × num_heads × head_dim × 2 (K+V) × num_layers
+1. native 后端先 `check_for_offload` 选出可下沉用户，并再查一次 host 已存长度
+   （`kvcache_manager.py:178-190`），以支持多 GPU 实例场景。
+2. `acquire_offload_pages` 锁定待下沉的 GPU 页（按用户）
+   （`kvcache_manager.py:195-204`、`gpu_kvcache_manager.py:203-209`）。
+3. `host_kvstorage_manager.offload_kvcache_launch(...)` 发起异步 D2H
+   （`kvcache_manager.py:209-216`）。
+4. 若 host 端拒绝（如过载，返回 `None/SKIPPED`），立即释放页锁
+   （`kvcache_manager.py:217-229`）。
+5. 成功则记入 `ongoing_offload_tasks`（`kvcache_manager.py:232`）。
 
-例：
-- num_primary_cache_pages = 4096
-- page_size = 64
-- num_heads = 32
-- head_dim = 96
-- num_layers = 12
+### 6.2 轮询回收 `offload_try_wait`（`kvcache_manager.py:235-269`）
 
-总GPU KV大小 = 4096 × 64 × 32 × 96 × 2 × 12 ≈ 18.7GB
-```
-
-### 5.2 主机缓存容量
-
-```python
-NativeHostKVCacheManager:
-  bytes_capacity_per_layer = 主机可用内存 / num_layers
-  
-  每用户容量 = bytes_capacity_per_layer / (num_heads × head_dim × 2)
-  
-  考虑因素：
-  - 主机内存大小（通常10-100GB）
-  - 并发用户数量
-  - 缓存数据的长期保留
-```
-
-### 5.3 缓存驱逐管理
-
-```python
-缓存驱逐优先级（从高到低）：
-1. GPU缓存 → 主机（onboarding不足时）
-2. 主机缓存 → SSD/远程（FlexKV后端）
-3. 完全清除（evict()）
-
-触发条件：
-- GPU页面不足：触发LRU驱逐最老用户
-- 主机缓存满：移动到下一层存储（FlexKV）
-- 显式调用evict()：清除特定用户或全部缓存
-```
+非阻塞遍历进行中的任务：
+- `LAUNCHED`：仍在传输，保留。
+- `READY`：`finish_task` 完成，并 `release_offload_pages(..., offloaded=1)` 解锁 GPU 页。
+- `SKIPPED`：跳过。
+- `FAILED/TIMEOUT/CANCELLED`：按 `host_kvstorage_fail_policy`：
+  - `fail_close` → 抛错；
+  - `fail_open` → `cancel_task` 并以 `offloaded=0` 释放页（GPU 数据保留，不丢正确性）。
 
 ---
 
-## 6. 两种后端对比
+## 7. 错误处理与回退
 
-### 6.1 Native后端
+### 7.1 onboard 失败（`kvcache_manager.py:127-164`）
 
-| 特性 | 实现 | 优势 |
-|------|------|------|
-| **存储层次** | GPU + CPU内存 | 简单，延迟低 |
-| **Onboarding** | 分层（layer-wise） | 与前层计算重叠 |
-| **Offloading** | 异步D2H | 后台运行，不阻塞 |
-| **容量** | 受主机内存限制 | 单机可达100GB+ |
-| **局限** | 单GPU+单推理实例 | 不支持分布式 |
+`onboard_wait` 在 `FAILED/TIMEOUT/CANCELLED` 时：
+- `revoke_onboard_pages` 撤销受影响页（`kvcache_manager.py:149-154`、`gpu_kvcache_manager.py:192-195`）；
+- flexkv 后端按 `fail_close` 抛错 / `fail_open` 告警继续（`kvcache_manager.py:155-163`）。
 
-### 6.2 FlexKV后端
+`onboard_try_wait`（`kvcache_manager.py:110-125`）：native 真正非阻塞；
+flexkv 当前未实现，会退化为阻塞 `onboard_wait` 并打印告警。
 
-| 特性 | 实现 | 优势 |
-|------|------|------|
-| **存储层次** | GPU + CPU + SSD + 远程 | 几乎无限容量 |
-| **架构** | 客户端-服务器 | 支持多GPU和分布式 |
-| **吞吐** | 跨机器传输 | 适合超大规模推理 |
-| **容量** | 按配置支持 | CPU块、SSD块可自定义 |
-| **权衡** | 网络延迟 | 延迟高于native |
+### 7.2 失败策略语义
+
+`host_kvstorage_fail_policy`：
+- `fail_open`（默认）：缓存子系统失败时尽量不影响推理正确性，回退到「重新计算/保留 GPU 数据」。
+- `fail_close`：一旦失败立即抛错，便于在严格场景暴露问题。
 
 ---
 
-## 7. 错误处理与恢复机制
+## 8. 两种 host 后端对比（基于源码事实）
 
-### 7.1 Onboarding失败处理
-
-```python
-if wait_result.status in (FAILED, TIMEOUT, CANCELLED):
-    # 1. 撤销GPU页面分配
-    self.gpu_kvcache_mgr.revoke_onboard_pages(
-        task_handle.user_ids,
-        task_handle.metadata["onboard_start_indices"],
-        task_handle.metadata["onboard_lengths"],
-    )
-    
-    # 2. 根据策略决定是否继续
-    if self.host_kvstorage_fail_policy == "fail_close":
-        raise RuntimeError(...)  # 停止推理
-    else:
-        # fail_open：忽略错误，继续使用已缓存数据
-        print("[WARNING] Onboarding failed but continuing...")
-        # GPU缓存仍然有效，可用旧数据
-```
-
-### 7.2 Offloading失败处理
-
-```python
-if wait_result.status in (FAILED, TIMEOUT, CANCELLED):
-    should_raise = self.host_kvstorage_fail_policy == "fail_close"
-    
-    if should_raise:
-        raise RuntimeError(f"Offloading failed for {failed_user_ids}")
-    else:
-        # fail_open：保留GPU缓存，不释放页面
-        offload_success = [0] * len(task_handle.user_ids)
-        self.host_kvstorage_manager.cancel_task(task_handle)
-    
-    # 释放GPU页面锁（标记为未下板）
-    self.gpu_kvcache_mgr.release_offload_pages(
-        offload_user_ids,
-        offload_start_indices,
-        offload_lengths,
-        offloaded=offload_success,  # 0表示未成功下板
-    )
-```
+| 维度 | NativeHostKVCacheManager | FlexKVStorageManager |
+|------|--------------------------|----------------------|
+| 存储 | pinned host memory | 接入 FlexKV（CPU/本地/远端块） |
+| 按层 onboard | 支持（`is_layerwise=True`） | 见各自实现 |
+| `onboard_try_wait` | 真非阻塞 | 暂未实现，退化为阻塞（`kvcache_manager.py:117-121`） |
+| 构造参数来源 | `kvcache_manager.py:289-306` | `kvcache_manager.py:307-346` |
+| 已知限制 | 至多 1 个 GPU 管理器 + 1 个推理实例，需配合 user_id 路由隔离（`README.md:89-91`） | 客户端-服务器，可扩展多级 |
 
 ---
 
-## 8. 实际应用在HSTU模型中
+## 9. 已知限制（来自 `README.md:83-91`）
 
-### 8.1 工作流总结
-
-```
-InferenceRankingGR.forward_with_kvcache()
-│
-├─ 【Step 1】查询缓存
-│  └─ kvcache.lookup_kvcache(user_ids, seq_lengths)
-│
-├─ 【Step 2】分配GPU页面
-│  └─ kvcache.allocate_kvcache(index_meta, lookup_res)
-│
-├─ 【Step 3】启动异步H2D
-│  └─ kvcache.onboard_launch(index_meta, lookup_res, metadata)
-│
-├─ 【Step 4】去除缓存token
-│  └─ strip_cached_tokens(batch, cached_lengths)
-│
-├─ 【Step 5】Embedding查询
-│  └─ sparse_module(stripped_batch.features)
-│
-├─ 【Step 6】HSTU推理
-│  ├─ InferenceDenseModule.forward_with_kvcache()
-│  │  ├─ 每层：stream_wait_layer() 确保H2D完成
-│  │  ├─ HSTU自注意力计算（读GPU缓存KV）
-│  │  └─ append_kvcache() 写入新KV数据
-│  │
-│  └─ 完整信息：kvcache_metadata包含所有索引信息
-│
-├─ 【Step 7】MLP预测
-│  └─ self._mlp(batch_output)
-│
-├─ 【Step 8】启动异步D2H
-│  └─ kvcache.offload_launch(index_meta)
-│
-└─ 【Step 9】返回结果
-   └─ logits（offload继续后台运行）
-
-后续：offload_try_wait() 轮询下板完成
-```
-
-### 8.2 缓存覆盖示例
-
-```
-用户 User_123：历史序列 [A1, A2, ..., A10, I1, I2, ..., I5]
-总长度：15 tokens
-
-查询结果：
-  GPU缓存：[0, 8]  - 前8个token的KV在GPU
-  主机缓存：[0, 12] - 前12个token的KV在主机
-  合并后：[0, 12]  - 缓存覆盖前12个token
-
-当前请求：序列长度仍为15
-  新增token：15 - 12 = 3个（I3, I4, I5）
-  需要计算KV：只计算这3个token
-  
-实际处理：
-  1. strip_cached_tokens 去掉前12个token
-  2. 输入变为 [I3, I4, I5] + contextual_features
-  3. 计算embedding（减少3倍计算）
-  4. HSTU只处理这3个新token
-  5. 新KV数据追加到GPU缓存中
-  6. 用户总缓存变为15 tokens
-```
+1. `allocate_kvcache` 为 host 阻塞，不能与其它操作重叠。
+2. 每个 device 仅允许 **一个** GPU KV 管理器，且每个 GPU 管理器仅一个推理实例。
+3. native host 后端同样限制为至多一个 GPU 管理器 + 一个推理实例，需配合 user_id 路由与实例隔离。
 
 ---
 
-## 9. 关键API使用指南
+## 10. 一句话总结
 
-### 9.1 核心API
-
-```python
-# 1. 查询和分配
-index_meta, lookup_res = kvcache.lookup_kvcache(user_ids, seq_lengths)
-kvcache_metadata = kvcache.allocate_kvcache(index_meta, lookup_res)
-
-# 2. 异步传输（启动）
-kvcache.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-kvcache.offload_launch(index_meta)
-
-# 3. 同步等待
-kvcache.onboard_wait(index_meta, task_handle)      # 阻塞
-result = kvcache.onboard_try_wait(index_meta, task_handle)  # 非阻塞
-kvcache.offload_try_wait()                         # 轮询下板任务
-
-# 4. 数据操作
-kvcache.gpu_kvcache_mgr.put(k, v, layer_idx, metadata)  # 写入
-k_cache, v_cache = kvcache.gpu_kvcache_mgr.get(page_ids, last_page_lens, layer_idx)
-
-# 5. 清理
-kvcache.evict(user_ids)                            # 清除特定用户
-kvcache.evict_all()                                # 清除全部
+KVCache 在本仓库的应用可概括为四段式：
+**查找(GPU+host) → 分配(分页+LRU) → 异步 onboard 并剥离已缓存 token →
+在每个 HSTU 层内 append 新 KV、按层等待 H2D、从分页表做 attention → 异步 offload 回收**。
+其性能收益来自三处重叠：onboard 与 strip/embedding 重叠、按层 H2D 与逐层计算重叠、
+offload 与 post/MLP 重叠；正确性回退由 fail_open/fail_close 策略与 revoke/release 路径保证。
 ```
-
-### 9.2 常见模式
-
-```python
-# 模式1：阻塞推理（确保数据就位）
-index_meta, lookup_res = kvcache.lookup_kvcache(user_ids, seq_lengths)
-kvcache_metadata = kvcache.allocate_kvcache(index_meta, lookup_res)
-kvcache.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-
-# embedding和preprocess...
-
-kvcache.onboard_wait(index_meta, kvcache_metadata.kv_onload_handle)
-# 确保H2D完成后再推理
-inference_output = hstu_model(...)
-
-# 模式2：异步推理（最大化重叠）
-index_meta, lookup_res = kvcache.lookup_kvcache(user_ids, seq_lengths)
-kvcache_metadata = kvcache.allocate_kvcache(index_meta, lookup_res)
-kvcache.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-
-# embedding和preprocess（与H2D并行）
-embeddings = embedding_module(features)
-
-# onboard_try_wait 仅在native后端按层调用
-for layer_idx in range(num_layers):
-    kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
-    inference_output = hstu_block[layer_idx](...)
-
-# 模式3：轮询下板完成
-kvcache.offload_launch(index_meta)
-
-while has_ongoing_tasks:
-    # 其他推理任务...
-    
-    kvcache.offload_try_wait()  # 非阻塞轮询
-```
-
----
-
-## 10. 性能指标与预期收益
-
-### 10.1 性能收益
-
-| 场景 | 优化前 | 优化后 | 收益 |
-|------|--------|--------|------|
-| **缓存命中率100%** | 全量前向 | 仅新token | **3-5倍** |
-| **缓存命中率80%** | 全量前向 | 部分计算 | **2-3倍** |
-| **H2D重叠** | H2D + 计算 | 并行 | **20-30%** |
-| **Batch推理** | 串行 | 异步重叠 | **10-15%** |
-
-### 10.2 内存占用
-
-```
-GPU内存：primary_pages × page_size × factor
-         4096 × 64 × ~5 MB ≈ 20GB （per device）
-
-主机内存：根据capacity_per_layer设置
-         通常10-100GB
-
-总存储：GPU + Host + （FlexKV后可达TB级）
-```
-
-### 10.3 延迟分析
-
-```
-传统推理：T_total = T_embedding + T_hstu + T_mlp
-
-KVCache推理：
-  T_total = max(T_h2d, T_embedding) + T_hstu_new + T_mlp + T_d2h_async
-  
-  其中：
-  - T_h2d 与 T_embedding 重叠
-  - T_d2h_async 后台进行，不计入当前请求延迟
-
-最优情况（缓存命中100% + 异步完全重叠）：
-  T_total ≈ T_embedding + T_hstu_new (<<< original T_total)
-```
-
----
-
-## 总结
-
-KVCache系统通过以下核心机制实现高效推理：
-
-1. **分层存储**：GPU快速访问，主机和SSD作为扩展存储
-2. **用户级缓存**：基于user_id的高效查询，适应推荐系统特性
-3. **异步重叠**：H2D/D2H与计算并行，最小化同步开销
-4. **智能驱逐**：LRU策略保证热用户优先级
-5. **灵活后端**：Native支持单机高效，FlexKV支持分布式扩展
-
-这使得HSTU模型在推荐场景下能够以**2-5倍的推理加速**运行，同时保持质量不变。
