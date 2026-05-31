@@ -1,13 +1,13 @@
-# FBGEMM HSTU Attention: hstu_compute_attn_1rowblock Detailed Analysis
+# FBGEMM HSTU注意力机制：hstu_compute_attn_1rowblock详细分析
 
-**File**: corelib/hstu/csrc/hstu_attn/src/hstu_fwd.h
-**Function**: `hstu_compute_attn_1rowblock` (lines 46-711)
-**Type**: CUDA Device Kernel Function (per-row-block computation)
-**Role**: Core single-row-block attention computation, called by hstu_fwd_kernel with different (m_block, bidh, bidb)
+**文件位置**：corelib/hstu/csrc/hstu_attn/src/hstu_fwd.h
+**函数名**：`hstu_compute_attn_1rowblock`（第46-711行）
+**函数类型**：CUDA设备内核函数（单行块计算）
+**核心作用**：针对一个查询块计算HSTU注意力，由hstu_fwd_kernel使用不同的(m_block, bidh, bidb)调用
 
 ---
 
-## Part 0: Function Signature and Purpose
+## 第0部分：函数签名和目的
 
 ```c++
 template <typename Kernel_traits, typename Params>
@@ -19,309 +19,311 @@ inline __device__ void hstu_compute_attn_1rowblock(
 );
 ```
 
-### Purpose
-Computes HSTU attention for a single **block of rows** (queries) with respect to all valid **blocks of columns** (keys/values). This is the computational core of the forward pass kernel and handles:
+### 函数目的
 
-1. **Query block selection**: Process rows m_block*kBlockM to (m_block+1)*kBlockM
-2. **Key/Value block iteration**: Loop over all valid n_block ranges
-3. **Attention computation**: QK^T + RAB → SiLU activation → QK·V
-4. **Mask application**: Causal, local, arbitrary, target, and context-specific masking
-5. **Output accumulation and scaling**: Accumulate across K/V blocks, scale by sequence length
+针对**单个行块（queries）**与所有有效的**列块（keys/values）**计算HSTU注意力。这是前向传播核心函数，负责：
 
-### Context in Kernel Grid
+1. **查询块选择**：处理行 m_block*kBlockM 至 (m_block+1)*kBlockM
+2. **K/V块迭代**：遍历所有有效的n_block范围
+3. **注意力计算**：QK^T + RAB → SiLU激活 → QK·V
+4. **掩码应用**：因果、局部、任意、目标和上下文特定掩码
+5. **输出累积和缩放**：跨K/V块累积，按序列长度缩放
+
+### 核心计算流程
 
 ```
-hstu_fwd_kernel (gridDim = [num_m_blocks, num_heads, batch_size])
+CUDA网格 [num_m_blocks, num_heads, batch_size]
   ↓
-hstu_compute_attn_1rowblock(params, bidb=blockIdx.z, bidh=blockIdx.y, m_block=blockIdx.x)
+每个线程块执行：hstu_compute_attn_1rowblock(
+  params=全局参数,
+  bidb=blockIdx.z（批次索引）,
+  bidh=blockIdx.y（头索引）,
+  m_block=blockIdx.x（查询块索引）
+)
 ```
 
-Each block computes attention for one (batch, head, m_block) independently.
+---
+
+## 第1部分：三个参数的完整语义
+
+### 输入参数概览
+
+| 参数 | 类型 | 语义说明 |
+|------|------|---------|
+| `params` | `const Params&`（即`Hstu_fwd_params`） | 全局核函数配置：指针、步长、维度、标志 |
+| `bidb` | `int` | 批次维度索引（这是批处理中的第几个序列） |
+| `bidh` | `int` | 头维度索引（这是第几个注意力头） |
+| `m_block` | `int` | 查询块索引（处理第几个kBlockM大小的查询块） |
+
+### Hstu_fwd_params详细字段说明
+
+**维度参数**（hstu.h第107-114行）：
+
+| 字段 | 语义 |
+|------|------|
+| `b` | 批次大小 |
+| `seqlen_q` | 跨所有批次的总查询序列长度 |
+| `seqlen_k` | 跨所有批次的总键序列长度 |
+| `d` | 单头维度（如64或128） |
+| `seqlen_q_rounded, seqlen_k_rounded` | CUTLASS对齐后的填充维度 |
+| `scaling_seqlen` | 最终输出缩放因子（通常为max_seqlen_q） |
+| `alpha` | HSTU注意力权重系数（通常为0.5） |
+| `target_group_size` | 每组目标令牌数量 |
+| `window_size_left, window_size_right` | 局部窗口尺寸（若启用） |
+
+**存储指针参数**：
+
+| 字段 | 含义 |
+|------|------|
+| `q_ptr, k_ptr, v_ptr` | 查询、键、值矩阵（全局内存） |
+| `o_ptr` | 输出矩阵（全局内存） |
+| `kv_cache_ptr` | 分页KV缓存：[num_pages, 2(k/v), page_size, num_heads, head_dim] |
+| `rab_ptr` | 相对注意力偏置：[seqlen_q, seqlen_k_rounded]（每批次/头） |
+
+**分页KV缓存参数**：
+
+| 字段 | 含义 |
+|------|------|
+| `page_ids[...]` | 该用户的KV所在物理页索引数组 |
+| `page_offsets[bidb]` | page_ids数组中用户bidb的起始索引 |
+| `last_page_lens[bidb]` | 最后一页的有效令牌数（可能不满） |
+| `page_size` | 每页令牌数（通常为64） |
+| `total_pages` | 物理页总数 |
+
+**掩码参数**：
+
+| 字段 | 含义 |
+|------|------|
+| `is_causal` | 是否使用因果掩码（编译时常量） |
+| `is_local` | 是否使用局部窗口掩码 |
+| `is_target` | 是否有目标/候选段 |
+| `is_context` | 是否有非因果上下文段 |
+| `is_arbitrary_mask` | 是否使用任意函数掩码 |
+| `func_ptr` | 任意函数的min/max范围：[batch, head, n_func, seqlen_q] |
+| `n_func` | 函数范围数量 |
+
+**步长参数**（用于CUTLASS/CUTE张量索引）：
+
+| 字段类 | 说明 |
+|--------|------|
+| `*_row_stride` | 行间步长（字节） |
+| `*_head_stride` | 头间步长（字节） |
+| `kv_cache_page_stride, kv_cache_kvtensor_stride` | 分页缓存步长 |
+| `rab_seqlen_qk_stride, rab_seqlen_q_stride` | RAB的(batch,head)步长 |
 
 ---
 
-## Part 1: Parameter Semantics
+## 第2部分：类型系统和编译时常量
 
-### Input Parameters
-
-| Parameter | Type | Semantics |
-|-----------|------|-----------|
-| `params` | `const Params&` (i.e., `Hstu_fwd_params`) | Global kernel configuration: pointers, strides, dimensions, flags |
-| `bidb` | `int` | Batch dimension index (which sequence in the batch) |
-| `bidh` | `int` | Head dimension index (which attention head) |
-| `m_block` | `int` | Query block index (which block of kBlockM queries to process) |
-
-### Params Breakdown (from hstu.h)
-
-**Dimension Parameters** (hstu.h:107-114):
-- `b`: batch size
-- `seqlen_q`: total query sequence length across all batches
-- `seqlen_k`: total key sequence length across all batches
-- `d`: head dimension (e.g., 64 or 128)
-- `seqlen_q_rounded, seqlen_k_rounded`: padded dimensions for CUTLASS
-- `scaling_seqlen`: divisor for final output scaling
-- `alpha`: HSTU attention weight coefficient (typically 0.5)
-- `target_group_size`: candidates-per-group for target segment
-
-**Pointer Parameters**:
-- `q_ptr, k_ptr, v_ptr`: Query, Key, Value matrices (global memory)
-- `o_ptr`: Output matrix (global memory)
-- `kv_cache_ptr`: Paged KV cache [num_pages, 2(k/v), page_size, num_heads, head_dim]
-- `rab_ptr`: Relative Attention Bias [seqlen_q, seqlen_k_rounded] per batch/head
-
-**Paged KV Parameters**:
-- `page_ids[page_offset[bidb] : page_offset[bidb+1]]`: which physical pages hold this user's KV
-- `page_offsets[bidb]`: starting index in page_ids array for user bidb
-- `last_page_lens[bidb]`: how many tokens in the last partial page
-- `page_size`: tokens per page (typically 64)
-
-**Mask Parameters**:
-- `is_causal`: causality mask (col <= row)
-- `is_local`: local window mask (window_size_left, window_size_right)
-- `is_target`: attention split between history and candidate targets
-- `is_context`: bidirectional context segment (non-causal)
-- `is_arbitrary_mask`: arbitrary function-based masking
-- `func_ptr`: arbitrary function min/max ranges
-
-**Stride Parameters** (for CUTLASS/CUTE tensor indexing):
-- `q_row_stride, k_row_stride, v_row_stride`: stride between rows (bytes)
-- `q_head_stride, k_head_stride, v_head_stride`: stride between heads (bytes)
-- `o_row_stride, o_head_stride`: output strides
-- `kv_cache_row_stride, kv_cache_head_stride, kv_cache_page_stride, kv_cache_kvtensor_stride`: paged cache strides
-
-**RAB Strides**:
-- `rab_seqlen_qk_stride`: stride to next (batch, head) pair
-- `rab_seqlen_q_stride`: stride to next head (within batch)
-- `rab_seqlen_k_stride`: stride between K dimensions
-
----
-
-## Part 2: Type System and Compile-Time Constants
-
-### Template Types (lines 51-53)
+### 模板类型定义（第51-53行）
 
 ```c++
-using Element = typename Kernel_traits::Element;          // FP16 or BF16
-using ElementAccum = typename Kernel_traits::ElementAccum; // FP32 (for accumulation)
-using index_t = typename Kernel_traits::index_t;          // int32 or int64
+using Element = typename Kernel_traits::Element;           // FP16或BF16
+using ElementAccum = typename Kernel_traits::ElementAccum;  // FP32累积
+using index_t = typename Kernel_traits::index_t;           // int32或int64
 ```
 
-### Kernel Traits Constants (lines 59-72)
+### 核心Kernel_traits编译时常量
 
-| Constant | Type | Meaning |
-|----------|------|---------|
-| `Is_causal` | `bool` | Compile-time causal mask flag |
-| `Is_target` | `bool` | Compile-time target segment present flag |
-| `Is_context` | `bool` | Compile-time context segment present flag |
-| `Is_arbitrary` | `bool` | Compile-time arbitrary mask flag |
-| `kNFunc` | `int` | Number of function ranges (for arbitrary masking) |
-| `Is_local` | `bool` | Compile-time local window mask flag |
-| `Has_rab` | `bool` | Compile-time RAB (Relative Attention Bias) flag |
-| `Paged_KV` | `bool` | Compile-time paged KV cache flag |
-| `kBlockM` | `int` | Query block size (e.g., 64 or 128) |
-| `kBlockN` | `int` | Key/Value block size (typically = page_size if paged, otherwise CUTLASS tile) |
-| `kHeadDim` | `int` | Head dimension (e.g., 64, 128) |
+| 常量 | 类型 | 含义 |
+|------|------|------|
+| `Is_causal` | `bool` | 编译时因果掩码标志 |
+| `Is_target` | `bool` | 编译时目标段存在标志 |
+| `Is_context` | `bool` | 编译时上下文段存在标志 |
+| `Is_arbitrary` | `bool` | 编译时任意掩码标志 |
+| `Is_local` | `bool` | 编译时局部窗口标志 |
+| `Has_rab` | `bool` | 编译时相对注意力偏置标志 |
+| `Paged_KV` | `bool` | 编译时分页KV缓存标志 |
+| `kBlockM` | `int` | 查询块大小（如64或128） |
+| `kBlockN` | `int` | K/V块大小（分页时=page_size） |
+| `kHeadDim` | `int` | 头维度（如64、128） |
+| `kNFunc` | `int` | 任意函数范围数量 |
 
-These enable heavy optimization via template specialization (no runtime branching for major paths).
+**优化策略**：这些编译时常量启用重度模板特化，避免大分支的运行时开销。
 
 ---
 
-## Part 3: Memory Layout and Shared Memory Organization
+## 第3部分：内存布局和共享内存组织
 
-### Shared Memory Layout (lines 79-84)
-
-The shared memory is partitioned as:
+### 共享内存分区（第79-84行）
 
 ```
-[smem_q (Q matrix)] [smem_k/smem_v (K/V buffers)] [smem_rab (RAB buffer)] [smem_valid_ids/func_info]
-    ↓                       ↓                              ↓                        ↓
-  [Q tensor]      [K and V staging buffer]     [RAB for current K/V block]  [arbitrary mask data]
+[共享Q矩阵] [K/V缓冲区] [RAB缓冲区] [有效块ID和函数范围数据]
+    ↓             ↓            ↓                    ↓
+[Q张量]    [K和V分段缓冲]  [当前K/V块的RAB]  [任意掩码数据]
 
-Sizes:
-- smem_q: Kernel_traits::kSmemSizeQKV (layout per Kernel_traits::SmemLayoutQ)
-- smem_k/v: Kernel_traits::kSmemSizeQKV (shared or separate buffers)
+大小分布：
+- smem_q: Kernel_traits::kSmemSizeQKV（按SmemLayoutQ组织）
+- smem_k/v: 共享或分离缓冲（使用buffer_stage索引）
 - smem_rab: Kernel_traits::kSmemSizeRab
-- smem_valid_ids: int array for valid K/V block indices
-- sf_min, sf_max: int arrays for min/max function ranges
+- sValidBlockIds: 有效K/V块索引整数数组
+- sf_min, sf_max: 函数范围的最小/最大值整数数组
 ```
 
-**Key Points**:
-- **SmemLayoutQ**: Swizzled layout for efficient bank access during Q transpose
-- **SmemLayoutKV**: K and V use same layout, indexed with different buffer_stage
-- **SmemLayoutVtransposed**: V transposed for optimized V@S^T computation
-- **SmemLayoutRab**: RAB layout matching CUTLASS MMA fragment shapes
-- **Share_Q_K_smem**: If true, K overwrites Q's smem after Q copy completes
+**关键点**：
+- **SmemLayoutQ**：反棋盘式布局，避免查询转置时的bank冲突
+- **SmemLayoutKV**：K和V使用相同布局，通过buffer_stage区分
+- **SmemLayoutVtransposed**：V转置后的布局，优化V@S^T计算
+- **Share_Q_K_smem**：若为true，K加载完成后覆盖Q的共享内存
 
-### Global Memory Tensor Setup (lines 155-200)
+### 全局内存张量设置（第155-200行）
 
-**Query Tensor**:
+**查询张量**：
 ```c++
-mQ = [actual_seqlen_q, num_heads, head_dim]  // All queries for this batch
-gQ = local_tile(mQ, [kBlockM, kHeadDim], [m_block, 0])  // Tile for this row-block
+mQ = [actual_seqlen_q, num_heads, head_dim]  // 该批次所有查询
+gQ = local_tile(mQ, [kBlockM, kHeadDim], [m_block, 0])  // 当前行块的瓦片
 ```
-Stride: `(q_row_stride, q_head_stride, 1)` bytes
+步长：`(q_row_stride, q_head_stride, 1)`字节
 
-**Key Tensor (dual source)**:
+**键张量（双源）**：
 ```c++
-// Regular K (for input candidates):
-mK = [actual_seqlen_t, num_heads_k, head_dim]  // Input target keys (if Paged_KV)
-gK = local_tile(mK, [kBlockN, kHeadDim], [n_block, 0])  // Per K/V block
+// 常规K（用于输入候选）：
+mK = [actual_seqlen_t, num_heads_k, head_dim]
+gK = local_tile(mK, [kBlockN, kHeadDim], [n_block, 0])
 
-// Paged K (for cached history):
+// 分页K（用于缓存历史）：
 mKV_page = [total_pages, 2(k/v), page_size, num_heads_k, head_dim]
-gK_page = local_tile(mKV_page(page_id, k_kv, :, head, :), [1, kBlockN, kHeadDim], [:, :, :])
+gK_page = local_tile(mKV_page(...), [1, kBlockN, kHeadDim], ...)
 ```
 
-**Value Tensor (dual source)**: Similar to Key
+**值张量**：与键张量类似的双源结构
 
-**RAB Tensor** (if Has_rab):
+**RAB张量**（若Has_rab）：
 ```c++
-mRab = [actual_seqlen_q, seqlen_k_rounded]  // Per batch/head
+mRab = [actual_seqlen_q, seqlen_k_rounded]  // 每批次/头
 gRab = local_tile(mRab, [kBlockM, kBlockN], [m_block, n_block])
 ```
 
-**Tensor Notation**:
-- `mXxx`: Global memory tensor with full shape
-- `gXxx`: Global memory tile view for current block
-- `sXxx`: Shared memory tensor
-- `rXxx`: Register tensor (fragment)
-- `tXxx`: CUTLASS tiled view (partitioned across threads)
-
 ---
 
-## Part 4: Sequence Length Semantics and Offset Calculations
+## 第4部分：序列长度语义和偏移计算
 
-### Segment Definitions (lines 86-94)
+### 序列段分解（第86-94行）
 
-The sequence is decomposed into semantic segments:
+序列分为四个语义段：
 
 ```
-Overall sequence structure:
-[context] [history - cached] [history - new] [targets/candidates]
-    ↓              ↓                 ↓                 ↓
-[non-causal]   [paged KV]      [input K/V]    [input K/V, grouped]
+序列结构：
+[上下文] [历史-缓存部分] [历史-新增部分] [目标/候选]
+   ↓            ↓              ↓              ↓
+[非因果]     [分页KV]      [输入K/V]    [输入K/V，分组]
 
-Lengths:
-- actual_seqlen_q: number of query tokens for this batch
-- actual_seqlen_k: total number of key tokens
-- actual_seqlen_t: target/candidate tokens (if Is_target)
-- actual_seqlen_c: context tokens (if Is_context)
-- actual_seqlen_h: history tokens = actual_seqlen_k - actual_seqlen_t
-- actual_seqlen_offset: actual_seqlen_k - actual_seqlen_q (difference for alignment)
+对应长度：
+- actual_seqlen_q: 本批次查询令牌数
+- actual_seqlen_k: 总键令牌数
+- actual_seqlen_t: 目标/候选令牌数（若Is_target）
+- actual_seqlen_c: 上下文令牌数（若Is_context）
+- actual_seqlen_h: 历史令牌数 = actual_seqlen_k - actual_seqlen_t
+- actual_seqlen_offset: actual_seqlen_k - actual_seqlen_q（对齐差）
 ```
 
-**Key Insight**: The offset exists because:
-- Q dimension: represents only "new" or "query" positions
-- K dimension: represents historical + new + candidate tokens
+**关键洞察**：偏移存在的原因：
+- Q维度：仅表示"新"或"查询"位置
+- K维度：表示历史+新增+候选令牌
 
-Example with 10-token history, 5-token input candidates:
+**具体例子**（10令牌历史 + 5令牌输入候选）：
 ```
-actual_seqlen_k = 15 (10 history + 5 candidates)
-actual_seqlen_q = 5  (only query the 5 candidates)
+actual_seqlen_k = 15（10历史 + 5候选）
+actual_seqlen_q = 5（仅查询5个候选）
 actual_seqlen_offset = 15 - 5 = 10
 ```
 
-### Block Classification (lines 99-105)
+### 块分类（第99-105行）
 
 ```c++
-is_jump        // m_block transitions from history to targets (row-level jump in causal structure)
-is_in_target   // m_block overlaps with target segment
-is_in_context  // m_block within context segment (non-causal)
-is_in_mixed_context  // m_block spans context→history boundary
-is_in_paged_target   // m_block in targets AND using paged KV
-last_page_offset     // shift factor for partial last page in paged target section
+is_jump              // m_block从历史跳转到目标（行级跳跃）
+is_in_target         // m_block与目标段重叠
+is_in_context        // m_block在上下文段内（非因果）
+is_in_mixed_context  // m_block跨context→history边界
+is_in_paged_target   // m_block在目标段且使用分页KV
+last_page_offset     // 分页目标部分中最后一页的偏移
 ```
 
-These determine masking behavior and data source (regular vs. paged K/V).
+这些标志决定掩码行为和数据源（常规vs分页K/V）。
 
 ---
 
-## Part 5: Block Range Calculation and Masking
+## 第5部分：块范围计算和掩码约束
 
-### Valid K/V Block Range (lines 107-126)
+### 有效K/V块范围（第107-126行）
 
 ```c++
-// Number of history blocks (in paged KV or regular)
+// 历史段的块数（分页或常规）
 n_block_history = ceil(actual_seqlen_h / kBlockN)
 
-// Which block in the paged cache does history end and targets begin
+// 分页缓存中历史结束、目标开始的块
 n_block_paged = Paged_KV ? n_block_history : 0
 
-// Total target blocks
+// 总目标块数
 n_block_target = ceil(actual_seqlen_t / kBlockN)
 
-// Which target group this row belongs to (for grouped targets)
+// 该行所属的目标组
 target_index = (m_block * kBlockM - actual_seqlen_h) / target_group_size
 
-// Initial block range
-n_block_min = 0  // or window_size_left constraint if Is_local
+// 初始块范围
+n_block_min = 0  // 或受window_size_left约束（若Is_local）
 n_block_max = Paged_KV ? (n_block_history + n_block_target) : ceil(actual_seqlen_k / kBlockN)
 ```
 
-**Causal/Local Constraints** (lines 116-126):
+**因果/局部约束**（第116-126行）：
 ```c++
 if (Is_causal || Is_local) {
   int offset = (m_block + 1) * kBlockM + actual_seqlen_offset + window_size_right
   n_block_max = min(n_block_max, ceil(offset / kBlockN))
 }
 ```
-Ensures later queries don't attend to earlier keys (or exceeds window).
+确保后续查询不会关注更早的键（或超过窗口）。
 
-**Context-Specific Adjustments** (lines 123-126):
+**上下文特定调整**（第123-126行）：
 ```c++
 if (Is_context) {
   if (is_in_context || is_in_mixed_context) {
-    n_block_min = 0  // Can attend all history in context segment
+    n_block_min = 0  // 上下文段可关注所有历史
     n_block_max = max(n_block_history, n_block_max)
   }
 }
 ```
 
-### Masking Block Range (lines 128-137)
+### 掩码块范围（第128-137行）
 
 ```c++
-// Blocks where masking actually needs to apply (for causal)
+// 实际需要应用掩码的块
 n_masking_block_min = ceil((m_block * kBlockM + actual_seqlen_offset) / kBlockN)
 n_masking_block_max = ceil(min(actual_seqlen_k, (m_block + 1) * kBlockM + actual_seqlen_offset) / kBlockN)
 
-// Special handling for target jump
-if (Is_target && is_jump) {
-  n_masking_block_min = (actual_seqlen_h + actual_seqlen_offset + target_index * target_group_size) / kBlockN
-}
-
-// Number of K/V blocks that need masking applied
+// 需要应用掩码的K/V块数
 n_masking_steps = (Is_causal || is_in_context) ? 0 : (n_masking_block_max - n_masking_block_min)
 ```
 
-**Key Insight**: Only blocks where the row position crosses into a "valid" region need masking. Once in full-valid region, no masking.
+**关键洞察**：仅在行位置跨越"有效"区域的块需要掩码。一旦进入完全有效区域，无需掩码。
 
 ---
 
-## Part 6: Arbitrary Function Mask Processing
+## 第6部分：任意函数掩码处理
 
-### Arbitrary Mask Initialization (lines 140-152)
+### 任意掩码初始化（第140-152行）
 
-If `Is_arbitrary`, the function stores min/max value ranges for each query:
+若`Is_arbitrary`，函数为每个查询存储值范围的min/max：
 
 ```c++
-// func_ptr layout: [batch, heads, n_func ranges, seqlen_q]
-// Organized as two separate arrays: max_func and min_func
+// func_ptr布局：[batch, heads, n_func范围, seqlen_q]
+// 组织为两个分离数组：max_func和min_func
 Tensor mMaxFunc = make_tensor(..., [1, kNFunc/2+1, actual_seqlen_q])
 Tensor mMinFunc = make_tensor(..., [1, kNFunc/2, actual_seqlen_q])
 
-// Extract this query block's ranges
+// 提取当前查询块的范围
 Tensor gMaxFunc = local_tile(mMaxFunc, [kNFunc/2+1, kBlockM], [0, m_block])
 Tensor gMinFunc = local_tile(mMinFunc, [kNFunc/2, kBlockM], [0, m_block])
 ```
 
-Each query has `kNFunc/2` pairs of (min, max) ranges defining valid key positions.
+每个查询有`kNFunc/2`对(min, max)范围，定义有效的键位置。
 
-### Reduction and Valid Block Identification (lines 222-293)
+### 规约和有效块识别（第222-293行）
 
-Only one warp (warp 0) performs this:
+仅Warp 0执行此操作：
 
 ```c++
-// Parallel reduction within warp:
+// Warp内并行规约：
 for (int i = 0; i < size(gMinFunc); i++) {
   for (int j = lane_id; j < size(gMinFunc); j+=32) {
     row = base_row + j
@@ -329,13 +331,13 @@ for (int i = 0; i < size(gMinFunc); i++) {
       f_min = min(f_min, gMinFunc(i, j))
     }
   }
-  warpReduce(f_min, MinOp<int>())  // All lanes get the result
-  sFunc_min[i+1] = f_min  // Lane 0 writes to shared memory
+  warpReduce(f_min, MinOp<int>())  // 所有lane获得结果
+  sFunc_min[i+1] = f_min  // Lane 0写入共享内存
 }
-// Similar for f_max
+// 类似方式处理f_max
 ```
 
-Then iterate over all K/V blocks and test which ones overlap function ranges:
+然后遍历所有K/V块并测试哪些重叠函数范围：
 
 ```c++
 for (int n_block = n_block_min; n_block < n_block_max; n_block++) {
@@ -344,318 +346,239 @@ for (int n_block = n_block_min; n_block < n_block_max; n_block++) {
   for (int i = 0; i < (kNFunc+1)/2; i++) {
     int f_min = sFunc_min[i]
     int f_max = sFunc_max[i]
-    // Check three overlap conditions
-    if ((f_min <= b_min && f_max > b_min) ||      // Case 1: starts before
-        (f_min >= b_min && b_max > f_min) ||      // Case 2: starts within
-        (f_min >= b_min && f_max < b_max)) {      // Case 3: fully contained
+    // 检查三种重叠条件
+    if ((f_min <= b_min && f_max > b_min) ||      // 情况1：在前面开始
+        (f_min >= b_min && b_max > f_min) ||      // 情况2：在范围内开始
+        (f_min >= b_min && f_max < b_max)) {      // 情况3：完全包含
       sValidBlockIds[*sn_valid_block_max++] = n_block
-      break  // Only need one function range to match
+      break  // 只需一个函数范围匹配
     }
   }
 }
 ```
 
-**Outcome**: `sValidBlockIds[]` contains only the K/V blocks that overlap at least one function range.
+**结果**：`sValidBlockIds[]`仅包含与至少一个函数范围重叠的K/V块。
 
 ---
 
-## Part 7: Early Exit for Empty Blocks
+## 第7部分：空块早期退出
 
-### Zero Output Path (lines 295-320)
+### 零输出路径（第295-320行）
 
-If no valid K/V blocks (causal, local, or arbitrary constraints eliminate everything):
+若无有效K/V块（因果、局部或任意掩码约束排除一切）：
 
 ```c++
 if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
-  // Write zeros to output for this row block
+  // 为该行块写零输出
   Tensor mO = [...actual_seqlen_q, num_heads, head_dim]
   Tensor gO = local_tile(mO, [kBlockM, kHeadDim], [m_block, 0])
   
-  // Efficiently zero output with proper boundary handling
+  // 高效零化输出，正确处理边界
   flash::copy<Is_even_MN=false, Clear_OOB_MN=false, Clear_OOB_K=false>(
     gmem_tiled_copy_O, tOrO, tOgO, tOcO, actual_seqlen_q - m_block * kBlockM);
   return;
 }
 ```
 
-This avoids unnecessary computation when no keys can attend.
+这避免了无键可关注时的不必要计算。
 
 ---
 
-## Part 8: CUTLASS Copy Setup
+## 第8部分：主计算循环概览
 
-### Memory Hierarchy Copy Objects (lines 322-369)
-
-```c++
-// These are CUTLASS "tiled copy" objects that:
-// - Partition work across warps/threads
-// - Handle bank conflict avoidance
-// - Perform async memory operations
-
-typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;  // Global→Shared
-typename Kernel_traits::SmemCopyAtom{};  // Shared→Registers
-
-// Per-thread copy partitions:
-auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
-auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
-```
-
-### Predicate Setup for Boundary Handling (lines 373-408)
+### 循环结构（第410-660行）
 
 ```c++
-// Identity tensors for predicate generation
-Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
-Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);  // Coordinates for Q
+// 1. 前序阶段（第410-456行）
+//    - 加载初始RAB（若Has_rab）
+//    - 加载Q到共享内存
+//    - 加载初始K到共享内存
 
-// Lambda for conditional RAB copy (handles OOB):
-auto copy_if_g2s_rab = [&](int n_block_id, int buffer_stage) {
-  for (int m = 0; m < size<1>(ctQgRab_view); ++m) {
-    if (get<0>(tQcRab(0, m, 0)) < (actual_seqlen_q - m_block * kBlockM)) {
-      for (int k = 0; k < size<2>(ctQgRab_view); ++k) {
-        if (get<1>(tQcRab(0, m, k)) < (actual_seqlen_k - n_block_id * kBlockN)) {
-          cute::copy(gmem_tiled_copy_Rab, ctQgRab_view(_, m, k), ...);
-        }
-      }
-    }
-  }
-};
-```
-
-Prevents reading/writing out-of-bounds memory.
-
----
-
-## Part 9: Main Computation Loop - Overview
-
-### Loop Structure (lines 410-660)
-
-```c++
-// 1. Prologue (lines 410-456)
-//    - Load initial RAB (if Has_rab)
-//    - Load Q into shared memory
-//    - Load initial K into shared memory
-
-// 2. Main loop (lines 655-660)
+// 2. 主循环（第655-660行）
 for (int n_block = n_block_max - 1, masking_step = 0; 
      n_block >= n_block_min; 
      ++masking_step, --n_block) {
   fwd_step(n_block, masking_step);
   
-  // Handle jump from history to targets
+  // 处理从历史到目标的跳跃
   if (is_jump && masking_step == n_masking_steps - 1) {
     n_block = std::min(n_block, n_block_history);
   }
 }
 
-// 3. Epilogue (lines 662-710)
-//    - Scale output by scaling_seqlen
-//    - Write output to global memory
+// 3. 后序阶段（第662-710行）
+//    - 按scaling_seqlen缩放输出
+//    - 将输出写入全局内存
 ```
 
-**Key**: Iterates K/V blocks in **reverse order** (n_block_max down to n_block_min) for better cache locality (recency).
+**关键**：**倒序迭代**K/V块（从n_block_max到n_block_min），提高缓存局部性。
 
 ---
 
-## Part 10: Forward Step - Core Attention Computation
+## 第9部分：Forward Step - 核心注意力计算
 
-### fwd_step Lambda (lines 564-653)
+### fwd_step Lambda（第564-653行）
 
-This is called once per K/V block and performs:
+对每个K/V块调用一次，执行：
 
 ```c++
 auto fwd_step = [&](int n_valid_block, int masking_step) {
-  int n_block = !Is_arbitrary ? n_valid_block : sValidBlockIds[n_valid_block];
-  
-  // ============ 1. Async Load V ==============
-  // Wait for K load to complete
+  // ============ 1. 异步加载V ==============
+  // 等待K加载完成
   flash::cp_async_wait<0>();
   __syncthreads();
   
-  // Load V (next K/V block)
-  auto tVsV_stage_view = tVsV(_, _, _, buffer_stage);
+  // 加载V（下一K/V块）
   bool is_paged_tile = (n_block < n_block_paged) && Paged_KV;
-  if (masking_step > 0) {
-    flash::copy<Is_even_MN=true>(
-      gmem_tiled_copy_QKV,
-      is_paged_tile ? tVgV_page(..., params.page_ids[page_offset + n_block])
-                    : tVgV(..., n_block - n_block_paged),
-      tVsV_stage_view, ...);
+  if (is_paged_tile) {
+    // 从分页缓存读取
+    flash::copy<Is_even_MN=true>(...,
+      tVgV_page(..., params.page_ids[page_offset + n_block]), ...);
   } else {
-    // First iteration: V may have padding, clear OOB
-    if (!is_paged_tile) {
-      flash::copy<Is_even_MN=false, Clear_OOB_MN=true>(
-        gmem_tiled_copy_QKV, tVgV(..., n_block - n_block_paged),
-        tVsV_stage_view, ..., actual_seqlen - (n_block - n_block_paged) * kBlockN);
-    } else {
-      flash::copy<Is_even_MN=true>(...);
-    }
+    // 从常规缓冲读取，处理填充
+    flash::copy<Is_even_MN=false, Clear_OOB_MN=true>(...,
+      tVgV(..., n_block - n_block_paged), ...,
+      actual_seqlen_t - (n_block - n_block_paged) * kBlockN);
   }
-  cute::cp_async_fence();
   
-  // ============ 2. Compute QK^T + RAB ==============
+  // ============ 2. 计算QK^T + RAB ==============
   Tensor acc_s = partition_fragment_C(tiled_mma, [kBlockM, kBlockN]{});
-  flash::cp_async_wait<0>();  // Wait for K to arrive
+  flash::cp_async_wait<0>();
   __syncthreads();
   
   if (Has_rab) {
-    // Load RAB from shared memory into registers
+    // 加载RAB从共享内存到寄存器
     Tensor rRab = make_tensor<Element>(partition_shape_C(...));
-    auto tSrRab_view = smem_thr_copy_rab.retile_D(rRab);
-    cute::copy(smem_tiled_copy_rab, tSsRab(..., buffer_stage), tSrRab_view);
-    flash::convert_type_safe(rRab, acc_s);  // Copy RAB into accumulator
-    
-    // Prefetch next RAB
-    if (n_valid_block > n_block_min) {
-      int n_block_next = ...
-      if (n_block_next >= n_block_min) {
-        copy_g2s_rab(n_block_next, buffer_stage);
-      }
-    }
+    cute::copy(smem_tiled_copy_rab, tSsRab(..., buffer_stage), rRab);
+    flash::convert_type_safe(rRab, acc_s);  // 复制RAB到累积器
   } else {
-    clear(acc_s);  // Zero accumulator if no RAB
+    clear(acc_s);  // 若无RAB，清零累积器
   }
   
-  // Compute: acc_s = Q @ K^T + acc_s (with RAB or zeros)
+  // 计算：acc_s = Q @ K^T + acc_s（带RAB或零）
   flash::gemm<A_in_regs=Is_Q_in_regs>(
     acc_s, tSrQ, tSrK, tSsQ, tSsK(..., buffer_stage),
     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, ...);
   
-  // ============ 3. Apply Masks ==============
+  // ============ 3. 应用掩码 ==============
   if (Is_arbitrary || Is_local || is_masking) {
-    apply_mask(acc_s, n_block);  // Sets -INFINITY where invalid
+    apply_mask(acc_s, n_block);  // 在无效处设为-INFINITY
   }
   
-  // ============ 4. Activate with SiLU ==============
+  // ============ 4. SiLU激活==============
   for (int i = 0; i < size(acc_s); ++i) {
-    acc_s(i) *= params.alpha;  // Scale by alpha
+    acc_s(i) *= params.alpha;  // 乘以alpha
   }
   fast_silu(acc_s);  // acc_s(i) = acc_s(i) * tanh(acc_s(i) * 0.5)
   
-  // Convert: FP32 accumulator → FP16/BF16 precision
+  // 转换：FP32累积器 → FP16/BF16精度
   Tensor rP = make_tensor_like<Element>(acc_s);
   flash::convert_type_safe(acc_s, rP);
   
-  // ============ 5. Prefetch Next K ==============
+  // ============ 5. 预取下一K ==============
   flash::cp_async_wait<0>();
   __syncthreads();
   
   if (n_valid_block > n_block_min) {
     int n_block_next = ...
     bool is_paged_tile = (n_block_next < n_block_paged) && Paged_KV;
-    auto tKsK_stage_view_next = tKsK(..., buffer_stage);
     if (n_block_next >= n_block_min) {
       flash::copy<Is_even_MN=true>(
         gmem_tiled_copy_QKV,
         is_paged_tile ? tKgK_page(..., params.page_ids[page_offset + n_block_next])
                       : tKgK(..., n_block_next - n_block_paged),
-        tKsK_stage_view_next, ...);
+        ...);
     }
-    cute::cp_async_fence();
   }
   
-  // ============ 6. Compute (QK·V) ==============
-  Tensor tOrP = make_tensor(
-    rP.data(),
-    flash::convert_layout_acc_Aregs<TiledMma>(rP.layout()));
-  
+  // ============ 6. 计算(QK·V)==============
   flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(..., buffer_stage),
                  tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 };
 ```
 
-### Computation Breakdown
+### 计算分解
 
-**Step 2a: QK^T Computation**
-- `flash::gemm()`: Performs MMA (matrix-multiply-accumulate) using tensor cores
-- Loads Q from shared memory (resident)
-- Loads K from shared memory (just arrived)
-- Computes: `acc_s[i,j] = sum_k Q[i,k] * K[j,k]`
-- If Has_rab: Adds RAB values
+**步骤2a：QK^T计算**
+- `flash::gemm()`：使用张量核进行矩阵乘累加（MMA）
+- 从共享内存加载Q（常驻）
+- 从共享内存加载K（刚到达）
+- 计算：`acc_s[i,j] = sum_k Q[i,k] * K[j,k]`
+- 若Has_rab：加上RAB值
 
-**Step 4: HSTU Activation**
+**步骤4：HSTU特定激活**
 ```
-Critical HSTU-specific operation:
-1. acc_s *= alpha (typically 0.5)
-2. acc_s = SiLU(acc_s) = acc_s * sigmoid(acc_s) (fast approximate version)
-3. This replaces standard softmax(QK^T / sqrt(d))
+关键HSTU特定操作：
+1. acc_s *= alpha（通常为0.5）
+2. acc_s = SiLU(acc_s) = acc_s * sigmoid(acc_s)（快速近似版本）
+3. 这替代了标准的softmax(QK^T / sqrt(d))
 ```
 
-**Step 6: Attention × Value**
-- `flash::gemm_rs()`: Right-side GEMM (accumulates into acc_o)
-- Takes P (attention weights after SiLU)
-- Takes V (from shared memory)
-- Computes: `acc_o[i,d] += P[i,j] * V[j,d]`
-- Accumulates across all K/V blocks
+**步骤6：注意力×值**
+- `flash::gemm_rs()`：右侧GEMM（累积到acc_o）
+- 使用P（SiLU后的注意力权重）
+- 使用V（从共享内存）
+- 计算：`acc_o[i,d] += P[i,j] * V[j,d]`
+- 跨所有K/V块累积
 
-### Paged KV Cache Switching (lines 439-447, 575-587)
+### 分页KV缓存切换（第439-447、575-587行）
 
 ```c++
-// Paged tiles (history blocks):
+// 分页瓦片（历史块）：
 if (n_block < n_block_paged) {
   flash::copy<Is_even_MN=true>(...,
-    tKgK_page(_, _, _, params.page_ids[page_offset + n_block]),  // Index via page_ids
+    tKgK_page(_, _, _, params.page_ids[page_offset + n_block]),  // 通过page_ids索引
     tKsK_stage_view, ...);
 }
 
-// Non-paged tiles (target blocks):
+// 非分页瓦片（目标块）：
 else {
   flash::copy<Is_even_MN=false>(...,
-    tKgK(_, _, _, n_block - n_block_paged),  // Direct indexing
+    tKgK(_, _, _, n_block - n_block_paged),  // 直接索引
     tKsK_stage_view, ...,
     actual_seqlen_t - (n_block - n_block_paged) * kBlockN);
 }
 ```
 
-**Key Insight**: 
-- When `n_block < n_block_paged`: Read from scattered page_ids array (historical cached K/V)
-- When `n_block >= n_block_paged`: Read from contiguous input K/V (new candidates)
+**关键洞察**：
+- 当`n_block < n_block_paged`：从散射的page_ids数组读取（历史缓存K/V）
+- 当`n_block >= n_block_paged`：从连续输入K/V读取（新候选）
 
 ---
 
-## Part 11: Masking Logic - apply_mask Lambda
+## 第10部分：掩码逻辑 - apply_mask Lambda
 
-### Mask Application (lines 473-562)
+### 掩码应用（第473-562行）
 
 ```c++
 auto apply_mask = [&](auto& tSrS, int n_block) {
-  // tSrS is the attention weights (acc_s before SiLU)
-  // Create identity tensor for row/col coordinates
+  // tSrS是注意力权重（SiLU前的acc_s）
+  // 为行/列坐标创建身份张量
   Tensor cS = make_identity_tensor(Shape<kBlockM, kBlockN>{});
-  Tensor tScS = thr_mma.partition_C(cS);  // Partition across threads
   
   const int base_row = m_block * kBlockM + actual_seqlen_offset;
   const int base_col = n_block * kBlockN;
   
-  // Main loop over attention weight matrix
+  // 遍历注意力权重矩阵
   for (int mma_row = 0; mma_row < size<0>(tSrS_view); mma_row++) {
     const int block_row = get<Row>(tScS_view(mma_row, 0));
     const int row = block_row + base_row;
     
-    // Extract target-specific parameters
+    // 提取目标特定参数
     const int target_index = Is_target ? (row - actual_seqlen_h) / target_group_size : 0;
     const int target_col_limit_left = Is_target ? actual_seqlen_h + target_index * target_group_size : 0;
     
-    // Per-query function range (for arbitrary mask)
-    Tensor col_min, col_max;  // Indexed by function id
-    if (Is_arbitrary) {
-      col_max(0) = gMaxFunc(0, block_row);
-      for (int j = 0; j < size<0>(gMinFunc); ++j) {
-        col_min(j) = gMinFunc(j, block_row);
-        col_max(j+1) = gMaxFunc(j+1, block_row);
-      }
-    }
-    
-    // Inner loop: mask each column
+    // 遍历每一列
     for (int mma_col = 0; mma_col < size<1>(tSrS_view); mma_col++) {
       const int block_col = get<Col>(tScS_view(mma_row, mma_col));
       int col = block_col + base_col;
       
-      // Paged KV offset adjustment
+      // 分页KV偏移调整
       if (Paged_KV && row >= actual_seqlen_h) {
         col -= last_page_offset;
       }
       
-      // ===== Standard masking =====
+      // ===== 标准掩码 =====
       if (!Is_causal && !Is_local && !Is_arbitrary) {
         if (col >= actual_seqlen_k) {
           tSrS_view(mma_row, mma_col) = -INFINITY;
@@ -663,22 +586,22 @@ auto apply_mask = [&](auto& tSrS, int n_block) {
         }
       }
       
-      // ===== Causal/Local/Context masking =====
+      // ===== 因果/局部/上下文掩码 =====
       else {
-        // Context segment: history part is bidirectional
+        // 上下文段：历史部分是双向的
         if (Is_context) {
           if (row < actual_seqlen_c && col < actual_seqlen_h) {
-            continue;  // No mask in context←history
+            continue;  // 上下文←历史无掩码
           }
         }
         
-        // Causal constraint: col <= row + window_size_right
+        // 因果约束：col <= row + window_size_right
         if (col >= col_limit_right(row)) {
           tSrS_view(mma_row, mma_col) = -INFINITY;
           continue;
         }
         
-        // Local window: col >= row - window_size_left
+        // 局部窗口：col >= row - window_size_left
         if (Is_local) {
           if (col < col_limit_left(row)) {
             tSrS_view(mma_row, mma_col) = -INFINITY;
@@ -686,20 +609,20 @@ auto apply_mask = [&](auto& tSrS, int n_block) {
           }
         }
         
-        // Target masking: targets can only attend to their own group
+        // 目标掩码：目标只能关注自己组内的令牌
         if (Is_target) {
-          if (row >= actual_seqlen_h &&  // Query is in target
-              (col + (Paged_KV ? last_page_offset : 0)) >= actual_seqlen_h &&  // Key is in target
-              col < target_col_limit_left) {  // Key is in earlier target group
+          if (row >= actual_seqlen_h &&  // 查询在目标中
+              (col + (Paged_KV ? last_page_offset : 0)) >= actual_seqlen_h &&  // 键在目标中
+              col < target_col_limit_left) {  // 键在更早的目标组
             tSrS_view(mma_row, mma_col) = -INFINITY;
           }
         }
       }
       
-      // ===== Arbitrary function masking =====
+      // ===== 任意函数掩码 =====
       if (Is_arbitrary) {
         bool non_mask = false;
-        // Check against all function ranges
+        // 检查所有函数范围
         non_mask = (col_min(0) <= col) && (col < col_max(0));
         if (non_mask) continue;
         
@@ -712,305 +635,289 @@ auto apply_mask = [&](auto& tSrS, int n_block) {
           tSrS_view(mma_row, mma_col) = -INFINITY;
         }
       }
-    }  // col loop
-  }  // row loop
+    }  // 列循环
+  }  // 行循环
 };
 ```
 
-### Mask Types and Semantics
+### 掩码类型和语义
 
-| Mask Type | Condition | Meaning |
-|-----------|-----------|---------|
-| **Standard OOB** | `col >= actual_seqlen_k` | Padding beyond valid sequence length |
-| **Causal** | `col > row + window_size_right` | Future keys (can't attend) |
-| **Local** | `col < row - window_size_left` | Outside attention window |
-| **Context→History** | `row < actual_seqlen_c && col >= actual_seqlen_h` | Context queries don't attend to targets |
-| **Target→Target** | `row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left` | Targets can only attend to their own group |
-| **Arbitrary Function** | `col ∉ [col_min(j), col_max(j+1))` for any j | Query-specific valid key ranges |
+| 掩码类型 | 条件 | 含义 |
+|---------|------|------|
+| **标准越界** | `col >= actual_seqlen_k` | 超出有效序列长度的填充 |
+| **因果** | `col > row + window_size_right` | 未来的键（不能关注） |
+| **局部** | `col < row - window_size_left` | 超出注意力窗口 |
+| **上下文→历史** | `row < actual_seqlen_c && col >= actual_seqlen_h` | 上下文查询不关注目标 |
+| **目标→目标** | `row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left` | 目标只关注自己的组 |
+| **任意函数** | `col ∉ [col_min(j), col_max(j+1))` | 查询特定的有效键范围 |
 
-**Mask Set to**: `-INFINITY` (effective zero after softmax, but here post-SiLU, still acts as severe dampening)
+**掩码值**：设为`-INFINITY`（SiLU后仍作为强阻尼）
 
 ---
 
-## Part 12: Output Epilogue and Scaling
+## 第11部分：输出后序和缩放
 
-### Output Writing (lines 662-710)
+### 输出写入（第662-710行）
 
 ```c++
-// Scale by sequence length
+// 按序列长度缩放
 for (int i = 0; i < size(acc_o); ++i) {
   acc_o(i) /= params.scaling_seqlen;
 }
 
-// Convert: FP32 accumulator → FP16/BF16 output
+// 转换：FP32累积器 → FP16/BF16输出
 Tensor rO = make_tensor_like<Element>(acc_o);
 flash::convert_type_safe(acc_o, rO);
 
-// Write to shared memory staging area
+// 写入共享内存临时区域
 Tensor sO = make_tensor(sQ.data(), SmemLayoutO{});
-auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
-auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
-Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
-Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
-
 cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
-// Write from shared memory to global memory
+// 从共享内存写入全局内存
 Tensor mO = make_tensor(..., [actual_seqlen_q, num_heads, head_dim]);
 Tensor gO = local_tile(mO, [kBlockM, kHeadDim], [m_block, 0]);
 
-typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
-auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
-Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
-Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-
-__syncthreads();
-
-Tensor tOrO = make_tensor<Element>(shape(tOgO));
 cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
 
-// Final copy with boundary handling
-Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
-Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+// 最终拷贝，带边界处理
 flash::copy<Is_even_MN=false, Clear_OOB_MN=false, Clear_OOB_K=false>(
   gmem_tiled_copy_O, tOrO, tOgO, tOcO, actual_seqlen_q - m_block * kBlockM);
 ```
 
-**Scaling Semantics**: 
-- `scaling_seqlen` is typically `max_seqlen_q` or `actual_seqlen_q`
-- Acts as normalization to prevent output magnitude blow-up
+**缩放语义**：
+- `scaling_seqlen`通常为`max_seqlen_q`或`actual_seqlen_q`
+- 作为归一化，防止输出幅度爆炸
 
 ---
 
-## Part 13: Call Chain and Integration
+## 第12部分：调用链和集成
 
-### Invocation Hierarchy
+### 调用层次
 
 ```
 Python: hstu_attn_varlen_func (hstu_attn_interface.py:185)
-  → Python wrapper: HstuAttnVarlenFunc.forward (interface.py:248)
-  → C++ binding: hstu_attn_2_cuda.varlen_fwd (hstu_api.cpp:335)
-  → C++ dispatcher: run_hstu_fwd (via template instantiation)
-  → GPU kernel launch:
-      run_hstu_fwd_impl (line 748)
+  → Python包装：HstuAttnVarlenFunc.forward (interface.py:248)
+  → C++绑定：hstu_attn_2_cuda.varlen_fwd (hstu_api.cpp:335)
+  → C++分派：run_hstu_fwd（通过模板实例化）
+  → GPU核心启动：
+      run_hstu_fwd_impl (第748行)
         ↓
       kernel<<<grid, block, smem_size>>>(params)
         ↓
-      hstu_fwd_kernel (line 714)  [<<< grid >>>]
+      hstu_fwd_kernel (第714行)  [<<< grid >>>]
         ↓
-      hstu_compute_attn_1rowblock (line 47)  [Called once per thread block]
+      hstu_compute_attn_1rowblock (第47行)  [每个线程块调用一次]
 ```
 
-### Grid and Block Configuration
+### 网格和块配置
 
 ```c++
-// From run_hstu_fwd_impl (line 758-764)
+// 来自run_hstu_fwd_impl（第758-764行）
 const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
-dim3 grid(num_m_block, params.h, params.b);  // [num_query_blocks, num_heads, batch_size]
-dim3 block(Kernel_traits::kNThreads);  // e.g., 128 or 256 threads per block
+dim3 grid(num_m_block, params.h, params.b);  // [query块数, 头数, 批次]
+dim3 block(Kernel_traits::kNThreads);  // 如128或256线程/块
 
 kernel<<<grid, block, smem_size, stream>>>(params);
 ```
 
-**Mapping**:
-- `blockIdx.x` → `m_block` (query block 0..num_m_blocks-1)
-- `blockIdx.y` → `bidh` (head 0..num_heads-1)
-- `blockIdx.z` → `bidb` (batch 0..batch_size-1)
-- `threadIdx.x` → `tidx` (thread 0..kNThreads-1)
+**映射**：
+- `blockIdx.x` → `m_block`（查询块0..num_m_blocks-1）
+- `blockIdx.y` → `bidh`（头0..num_heads-1）
+- `blockIdx.z` → `bidb`（批次0..batch_size-1）
+- `threadIdx.x` → `tidx`（线程0..kNThreads-1）
 
-Each of `grid.x * grid.y * grid.z` thread blocks executes `hstu_compute_attn_1rowblock` independently.
+每个线程块独立执行`hstu_compute_attn_1rowblock`。
 
-### Synchronization Points
+### 同步点
 
 ```
-Within hstu_compute_attn_1rowblock:
-  __syncthreads()  [line 290, 317, 354, 434, 430, 453, 571, 618, 680, 698]
+hstu_compute_attn_1rowblock内的__syncthreads()：
+  第290、317、354、430、434、453、571、618、680、698行
   
-Purpose:
-- Coordinate shared memory access (producer/consumer)
-- Ensure async loads complete before read
-- Barrier before output writes
+目的：
+- 协调共享内存访问（生产者/消费者）
+- 确保异步加载完成后再读取
+- 输出写入前的屏障
 ```
 
-Each barrier ensures:
-1. All threads reach same point
-2. Shared memory writes visible to all threads
-3. Async operations acknowledged
+每个屏障确保：
+1. 所有线程到达同一点
+2. 共享内存写对所有线程可见
+3. 异步操作得到确认
 
 ---
 
-## Part 14: Common Pitfalls and Debugging
+## 第13部分：常见陷阱和调试
 
-### Pitfall 1: Paged KV Index Out of Bounds
-**Problem**: Accessing `params.page_ids[page_offset + n_block]` with invalid n_block
-**Check**: Ensure `n_block < n_block_paged` before using paged index
-**Debug**: Print `page_offset`, `n_block`, `n_block_paged`, `total_pages`
+### 陷阱1：分页KV索引越界
+**问题**：访问`params.page_ids[page_offset + n_block]`使用无效n_block
+**检查**：确保`n_block < n_block_paged`后再使用分页索引
+**调试**：打印`page_offset`、`n_block`、`n_block_paged`、`total_pages`
 
-### Pitfall 2: Mismatched Sequence Offsets
-**Problem**: Causal mask applies wrong causality due to offset confusion
-**Insight**: `row = m_block * kBlockM + actual_seqlen_offset`, `col = n_block * kBlockN`
-**Check**: Verify offset matches input semantics (e.g., 10-token history = offset 10)
+### 陷阱2：序列偏移不匹配
+**问题**：因果掩码因偏移混淆而应用错误因果性
+**洞察**：`row = m_block * kBlockM + actual_seqlen_offset`，`col = n_block * kBlockN`
+**检查**：验证偏移与输入语义匹配（如10令牌历史=偏移10）
 
-### Pitfall 3: Incorrect RAB Tensor Access
-**Problem**: RAB data corrupted due to wrong strides
-**Check**: Verify `rab_seqlen_qk_stride`, `rab_seqlen_q_stride`, `rab_seqlen_k_stride` match RAB allocation
+### 陷阱3：RAB张量访问不正确
+**问题**：由于步长错误导致RAB数据损坏
+**检查**：验证`rab_seqlen_qk_stride`、`rab_seqlen_q_stride`、`rab_seqlen_k_stride`与RAB分配匹配
 
-### Pitfall 4: Shared Memory Bank Conflicts
-**Problem**: Unexpected slowdown despite correct output
-**Solution**: SmemLayout (swizzled) is already designed to avoid conflicts
-**Note**: Do not rearrange swizzle pattern without profiling
+### 陷阱4：共享内存Bank冲突
+**问题**：尽管输出正确但性能意外下降
+**解决**：SmemLayout（反棋盘式）已设计避免冲突
+**注意**：不要在未性能分析的情况下重排反棋盘模式
 
-### Pitfall 5: SiLU Underflow/Overflow
-**Problem**: NaN in output due to large QK^T values
-**Mechanism**: `fast_silu()` uses tanh approximation (line 86 in utils.h)
-**Workaround**: Ensure alpha (typically 0.5) scales QK^T to reasonable range
+### 陷阱5：SiLU下溢/溢出
+**问题**：由于QK^T值过大导致输出NaN
+**机制**：`fast_silu()`使用tanh近似（utils.h第86行）
+**解决**：确保alpha（通常0.5）将QK^T缩放到合理范围
 
-### Pitfall 6: Arbitrary Mask Function Range Mismatch
-**Problem**: Valid K/V blocks skipped because function ranges don't align
-**Check**: Verify `func_ptr` data layout: `[batch, heads, n_func, seqlen_q]`
-**Debug**: Print `sFunc_min`, `sFunc_max`, `sValidBlockIds` arrays
-
----
-
-## Part 15: Performance Characteristics
-
-### Arithmetic Intensity
-- **2 × GEMM operations** (QK^T and P×V): High FLOPs
-- **SiLU activation**: Element-wise, low intensity
-- **Masking**: Predicate + conditional write, minimal overhead
-- **Paged KV access**: Gather via `page_ids` array (potential serialization)
-
-### Memory Patterns
-```
-Read:
-- Q: Sequential per row-block (coalesced)
-- K: Sequential per col-block (coalesced from paged or regular)
-- V: Sequential per col-block (coalesced)
-- RAB: Sequential (coalesced)
-
-Write:
-- O: Sequential per row-block (coalesced)
-```
-
-### Occupancy Drivers
-- **Shared memory**: kSmemSize (can limit occupancy if >96KB)
-- **Registers**: TiledMma fragments (typically high register count)
-- **Constraints**: Usually 1 block per SM due to smem requirements
-
-### Optimization Opportunities
-1. **Async copy pipelining**: K/V prefetch overlaps with compute (already done)
-2. **Register blocking**: Q in registers avoids shared memory if `Is_Q_in_regs` (already done)
-3. **Tensor core utilization**: Full utilization via MMA ops (already done)
-4. **Paged cache prefetching**: `page_ids` array could benefit from cache optimization
+### 陷阱6：任意函数范围不匹配
+**问题**：有效K/V块因函数范围不对齐被跳过
+**检查**：验证`func_ptr`数据布局：`[batch, heads, n_func, seqlen_q]`
+**调试**：打印`sFunc_min`、`sFunc_max`、`sValidBlockIds`数组
 
 ---
 
-## Part 16: Example: Complete Forward Pass Walkthrough
+## 第14部分：性能特征
 
-### Setup
+### 算术强度
+- **2×GEMM操作**（QK^T和P×V）：高浮点操作
+- **SiLU激活**：逐元素，低强度
+- **掩码**：谓词+条件写，最小开销
+- **分页KV访问**：通过`page_ids`数组散射（潜在序列化）
+
+### 内存访问模式
 ```
-Input:
+读取：
+- Q：按行块顺序（合并）
+- K：按列块顺序（从分页或常规合并）
+- V：按列块顺序（合并）
+- RAB：顺序（合并）
+
+写入：
+- O：按行块顺序（合并）
+```
+
+### 占有率驱动因素
+- **共享内存**：kSmemSize（若>96KB可限制占有率）
+- **寄存器**：TiledMma片段（通常寄存器使用率高）
+- **限制**：通常每SM 1个块（由于smem需求）
+
+### 优化机会
+1. **异步拷贝管线**：K/V预取与计算重叠（已完成）
+2. **寄存器分块**：Q在寄存器避免共享内存（已完成）
+3. **张量核利用**：通过MMA操作充分利用（已完成）
+4. **分页缓存预取**：`page_ids`数组可受益于缓存优化
+
+---
+
+## 第15部分：完整前向传播演示
+
+### 设置示例
+```
+输入：
 - batch_size = 1, num_heads = 8, head_dim = 64
-- seqlen_q = 5 (new tokens to query)
-- seqlen_k = 15 (10 cached history + 5 input candidates)
-- actual_seqlen_c = 0 (no context segment)
-- actual_seqlen_t = 5 (target segment)
-- target_group_size = 5 (each token attends to 5-token group)
-- is_causal = true, is_paged_kv = true, page_size = 64, window_size_right = 0, alpha = 0.5
+- seqlen_q = 5（新令牌查询）
+- seqlen_k = 15（10缓存历史 + 5输入候选）
+- actual_seqlen_c = 0（无上下文段）
+- actual_seqlen_t = 5（目标段）
+- target_group_size = 5（每令牌关注5令牌组）
+- is_causal = true, is_paged_kv = true, page_size = 64, alpha = 0.5
 
-Kernel traits:
-- kBlockM = 64, kBlockN = 64 (or page_size)
+核心traits：
+- kBlockM = 64, kBlockN = 64
 - kNWarps = 8
 - kHeadDim = 64
 ```
 
-### Execution
+### 执行流程
 
 ```
-Grid configuration:
-- gridDim = [1, 8, 1]  (1 query block, 8 heads, 1 batch)
+网格配置：
+- gridDim = [1, 8, 1]（1查询块，8头，1批次）
 - num_m_block = ceil(5 / 64) = 1
 
-Thread block for (m_block=0, bidh=0, bidb=0):
+线程块（m_block=0, bidh=0, bidb=0）执行：
   
-  Initialize:
+  初始化：
   - actual_seqlen_q = 5
   - actual_seqlen_k = 15
   - actual_seqlen_h = 10
   - actual_seqlen_t = 5
   - actual_seqlen_offset = 10
-  - n_block_history = ceil(10 / 64) = 1
+  - n_block_history = 1
   - n_block_paged = 1
-  - n_block_target = ceil(5 / 64) = 1
-  - n_block_max = 1 + 1 = 2
+  - n_block_target = 1
+  - n_block_max = 2
   - n_block_min = 0
   
-  Block status:
-  - is_jump = true  (m_block * kBlockM = 0, actual_seqlen_h = 10, so 0 < 10, jump will occur)
-  - is_in_target = true  ((m_block + 1) * kBlockM + offset = 64 + 10 = 74 > 10, yes)
+  块状态：
+  - is_jump = true
+  - is_in_target = true
   
-  Masking:
-  - n_masking_block_min = ceil((0 + 10) / 64) = 1
-  - n_masking_block_max = ceil(min(15, 64 + 10) / 64) = ceil(74 / 64) = 2
-  - n_masking_steps = 2 - 1 = 1 (one step where masking applies)
+  掩码：
+  - n_masking_block_min = 1
+  - n_masking_block_max = 2
+  - n_masking_steps = 1
   
-  Main loop iteration 1 (n_block = 1, masking_step = 0):
-  - is_paged_tile = (1 < 1) && true = false
-  - Load K[targets] from regular buffer (n_block - n_block_paged = 0)
-  - Compute QK^T + RAB for targets
-  - Apply causal mask (target row <= target col)
-  - Apply target group mask (target[i] only attends target[i%group_size])
+  主循环迭代1（n_block = 1, masking_step = 0）：
+  - is_paged_tile = false
+  - 从常规缓冲加载K[目标]
+  - 计算QK^T + RAB（目标）
+  - 应用因果掩码（目标行≤目标列）
+  - 应用目标分组掩码
   - SiLU(alpha * QK^T)
-  - Accumulate (QK·V)
+  - 累积(QK·V)
   
-  Main loop iteration 2 (n_block = 0, masking_step = 1):
-  - is_paged_tile = (0 < 1) && true = true
-  - Load K[history] from page_ids[0] (paged cache)
-  - Compute QK^T + RAB for history
-  - Causal mask: row (5+10) >= col (0), so no masking needed (all history valid)
+  主循环迭代2（n_block = 0, masking_step = 1）：
+  - is_paged_tile = true
+  - 从page_ids[0]加载K[历史]（分页缓存）
+  - 计算QK^T + RAB（历史）
+  - 因果掩码：行(5+10)≥列(0)，无需掩码（全历史有效）
   - SiLU(alpha * QK^T)
-  - Accumulate (QK·V)
+  - 累积(QK·V)
   
-  Epilogue:
-  - acc_o /= 5  (scaling_seqlen = actual_seqlen_q or max)
-  - Write output[0:5] to global memory
+  后序：
+  - acc_o /= 5（scaling_seqlen）
+  - 写output[0:5]到全局内存
 ```
 
 ---
 
-## Appendix: Key CUTLASS/CUTE Concepts
+## 第16部分：CUTLASS/CUTE核心概念
 
-### CuTE (Cooperative Thread Environment)
-- **Tensor**: Shape + Layout + Storage descriptor
-- **Tiled Copy**: Specifies how warp/block copies between memory levels
-- **Partition**: Maps single tensor to per-thread fragments
-- **Local Tile**: Extracts a block view from multi-block tensor
+### CuTE（协作线程环境）
+- **Tensor**：形状+布局+存储描述符
+- **Tiled Copy**：指定warp/块在内存层级间的拷贝方式
+- **Partition**：将张量映射到每线程片段
+- **Local Tile**：从多块张量提取块视图
 
-### CUTLASS MMA (Matrix Multiply Accumulate)
-- **TiledMma**: Describes warp-level MMA tile (e.g., m16n16k16)
-- **partition_fragment_A/B/C**: Maps thread indices to fragments
-- **gemm()**: Performs collective MMA across thread block
+### CUTLASS MMA（矩阵乘累加）
+- **TiledMma**：描述warp级MMA瓦片（如m16n16k16）
+- **partition_fragment_A/B/C**：映射线程索引到片段
+- **gemm()**：跨线程块执行集体MMA
 
-### Flash Attention Kernels
-- **cp_async_wait<N>**: Wait for N outstanding async loads
-- **gemm_rs()**: Right-side GEMM (accumulate into existing accumulator)
-- **convert_type_safe()**: Vectorized type conversion
+### Flash Attention核心函数
+- **cp_async_wait<N>**：等待N个未完成异步加载
+- **gemm_rs()**：右侧GEMM（累积到现有累积器）
+- **convert_type_safe()**：向量化类型转换
 
 ---
 
-## Summary
+## 总结
 
-`hstu_compute_attn_1rowblock` is the FBGEMM core kernel implementing HSTU attention for one query block. It:
+`hstu_compute_attn_1rowblock`是FBGEMM核心内核，为一个查询块实现HSTU注意力。它：
 
-1. **Maps** grid coordinates (m_block, bidh, bidb) to semantic positions
-2. **Calculates** valid K/V block ranges based on causality, locality, targets, context, and arbitrary masks
-3. **Loads** Q, K, V, RAB from global memory in coalesced patterns
-4. **Iterates** K/V blocks in reverse order, prefetching next K while computing current
-5. **Computes** QK^T + RAB → SiLU activation (HSTU-specific) → scales → QK·V
-6. **Applies** multi-level masking: causal, local, target-group, context, function-based
-7. **Accumulates** attention across blocks and scales by sequence length
-8. **Writes** output to global memory with boundary checking
+1. **映射**网格坐标(m_block, bidh, bidb)到语义位置
+2. **计算**基于因果性、局部性、目标、上下文和任意掩码的有效K/V块范围
+3. **加载**Q、K、V、RAB从全局内存（合并模式）
+4. **迭代**K/V块（倒序），一边预取下一K一边计算当前块
+5. **计算**QK^T + RAB → SiLU激活（HSTU特定）→ 缩放 → QK·V
+6. **应用**多层掩码：因果、局部、目标分组、上下文、函数基础
+7. **累积**跨块的注意力并按序列长度缩放
+8. **写入**输出到全局内存（带边界检查）
 
-The function demonstrates advanced GPU optimization techniques: async copy pipelining, bank-conflict-free shared memory layout, tensor core utilization, and careful register pressure management—all while supporting complex masking semantics specific to hierarchical token-wise attention in recommender systems.
+该函数演示了高级GPU优化技术：异步拷贝管线、无bank冲突共享内存布局、张量核利用和精细寄存器压力管理——同时支持推荐系统分层令牌级注意力特有的复杂掩码语义。
 
